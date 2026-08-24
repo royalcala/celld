@@ -82,6 +82,7 @@ pub use crate::host_channels::set_kv_blob_store;
 pub use crate::host_channels::set_outbound_ws_tx;
 pub use crate::host_channels::set_queue_dispatch_tx;
 pub use crate::host_channels::set_rpc_call_tx;
+pub use crate::host_channels::set_stub_rpc_tx;
 pub use crate::host_channels::set_svc_call_tx;
 pub use crate::host_channels::set_svc_rpc_tx;
 pub use crate::host_channels::AssetCallReq;
@@ -90,6 +91,7 @@ pub use crate::host_channels::GateReq;
 pub use crate::host_channels::QueueDispatchReq;
 pub use crate::host_channels::QueueLeaseRef;
 pub use crate::host_channels::RpcCallReq;
+pub use crate::host_channels::StubRpcReq;
 pub use crate::host_channels::SvcCallReq;
 pub use crate::host_channels::SvcRpcReq;
 #[cfg(celld_internal_tests)]
@@ -99,6 +101,7 @@ pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
 pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
 pub(crate) use crate::host_channels::RPC_CALL_TX;
+pub(crate) use crate::host_channels::STUB_RPC_TX;
 pub(crate) use crate::host_channels::SVC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_RPC_TX;
 pub(crate) use crate::http_streams::claim_http_stream;
@@ -604,6 +607,14 @@ pub enum CellJob {
         args: RpcData,
         reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
     },
+    StubRpc {
+        request_id: Option<RequestId>,
+        scope: String,
+        id: u64,
+        path: Option<Vec<String>>,
+        args: Option<Vec<u8>>,
+        reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
+    },
     WsOpen {
         scope: String,
         ws_id: u64,
@@ -665,6 +676,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { scope, .. }
             | CellJob::Rpc { scope, .. }
+            | CellJob::StubRpc { scope, .. }
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
@@ -705,6 +717,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::StubRpc { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
@@ -5325,6 +5338,25 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 },
             )
         }
+        CellJob::StubRpc {
+            request_id,
+            scope,
+            id,
+            path,
+            args,
+            reply,
+        } => start_cell_event(tc, &scope, Answer::CellRpc(reply), request_id, None, false, |tc| {
+            let f = internal_function(tc, "__dispatchStubRpc")?;
+            let path = v8::String::new(tc, &serde_json::to_string(&path)?).unwrap();
+            let args = match args {
+                Some(args) => bytes_value(tc, args),
+                None => v8::null(tc).into(),
+            };
+            let arguments = [v8::Number::new(tc, id as f64).into(), path.into(), args];
+            let recv = v8::undefined(tc).into();
+            f.call(tc, recv, &arguments)
+                .ok_or_else(|| anyhow!("dispatchStubRpc threw"))
+        }),
         CellJob::WsOpen {
             scope,
             ws_id,
@@ -6823,6 +6855,7 @@ ops! { OP_NAMES, install_op_functions,
         "__rpc_signal_unsubscribe" => op_rpc_signal_unsubscribe,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
+        "__stub_rpc_call" => op_stub_rpc_call,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -8983,6 +9016,40 @@ fn op_rpc_call(
     });
     let p = promise_for(scope, id);
     rv.set(p);
+}
+
+/// `__stub_rpc_call(scope, id, pathJson, argsScOrNull)` routes an RPC target
+/// operation back to the Durable Object isolate that created the target.
+fn op_stub_rpc_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let id = args.get(1).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let path: Option<Vec<String>> =
+        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
+    let args_value = args.get(3);
+    let call_args =
+        (!args_value.is_null_or_undefined()).then(|| view_bytes(args_value).unwrap_or_default());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = StubRpcReq {
+        scope: cell,
+        id,
+        path,
+        args: call_args,
+        reply: tx,
+    };
+    let op = asyncrt::enqueue(async move {
+        gated_channel_send(gate, &STUB_RPC_TX, request, "no stub RPC channel").await?;
+        match rx.await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(error) => Err(format!("stub RPC proxy dropped: {error}")),
+        }
+    });
+    rv.set(promise_for(scope, op));
 }
 
 /// Outbound `fetch` — the op behind the harness's `fetch()`. Resolves to a JSON

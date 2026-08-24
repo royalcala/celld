@@ -25,7 +25,8 @@ use celld::generation::{
 };
 use celld::js::{
     ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
-    QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
+    QueueDispatchReq, RpcCallReq, StubRpcReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions,
+    WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
 use celld::peer_auth::{self, PeerAuth};
@@ -1532,6 +1533,54 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     celld::js::RpcData::Json(String::from_utf8_lossy(&body).into_owned())
                 });
             }
+        }
+    }
+    .await;
+    let _ = reply.send(result);
+}
+
+/// An operation on an RPC target that a Durable Object exported to another
+/// isolate, routed back to the owning cell. Only a locally owned cell is
+/// supported: an RPC target lives in one isolate's memory and is not
+/// forwarded over the peer tunnel.
+async fn dispatch_stub_rpc(app: AppHandle, call: StubRpcReq) {
+    let StubRpcReq {
+        scope,
+        id,
+        path,
+        args,
+        reply,
+    } = call;
+    let result = async {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(&scope),
+            "cell scope is malformed or exceeds the fleet storage limit"
+        );
+        let Routed { request, route } = app
+            .request(scope.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("route stub RPC {scope}: {error:?}"))?;
+        match route {
+            Route::Local => {
+                let local_request_id = local_dispatch_request_id(None);
+                let completed = app
+                    .local_request(request, scope.clone(), local_request_id, "local")
+                    .run(async {
+                        app.runtime
+                            .as_ref()
+                            .context("no cell runtime")?
+                            .stub_rpc(scope, id, path, args, local_request_id)
+                            .await
+                    })
+                    .await;
+                match completed.result.map_err(local_request_error)?.data {
+                    celld::js::RpcData::V8(bytes) => Ok(Vec::from(bytes)),
+                    celld::js::RpcData::Json(_) => Err(anyhow::anyhow!("stub RPC answered JSON")),
+                }
+            }
+            Route::Remote { node, .. } => Err(anyhow::anyhow!(
+                "RPC target is on another celld node: {node}"
+            )),
         }
     }
     .await;
@@ -4342,6 +4391,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     }
     let (rpc_call_tx, mut rpc_call_rx) = mpsc::unbounded_channel();
     celld::js::set_rpc_call_tx(rpc_call_tx);
+    let (stub_rpc_tx, mut stub_rpc_rx) = mpsc::unbounded_channel();
+    celld::js::set_stub_rpc_tx(stub_rpc_tx);
     let (service_call_tx, mut service_call_rx) = mpsc::unbounded_channel();
     celld::js::set_svc_call_tx(service_call_tx);
     let (service_rpc_tx, mut service_rpc_rx) = mpsc::unbounded_channel();
@@ -4811,6 +4862,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 };
                 do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
             }
+            call = stub_rpc_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("stub RPC channel closed");
+                };
+                do_calls.push(Box::pin(dispatch_stub_rpc(app.clone(), call)));
+            }
             call = asset_call_rx.recv() => {
                 let Some(call) = call else {
                     anyhow::bail!("asset call channel closed");
@@ -5128,6 +5185,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     };
                     do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
                 }
+                call = stub_rpc_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("stub RPC channel closed during shutdown pre-drain");
+                    };
+                    do_calls.push(Box::pin(dispatch_stub_rpc(app.clone(), call)));
+                }
                 call = asset_call_rx.recv() => {
                     let Some(call) = call else {
                         anyhow::bail!("asset call channel closed during shutdown pre-drain");
@@ -5323,6 +5386,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         anyhow::bail!("Durable Object RPC channel closed during shutdown");
                     };
                     do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
+                }
+                call = stub_rpc_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("stub RPC channel closed during shutdown");
+                    };
+                    do_calls.push(Box::pin(dispatch_stub_rpc(app.clone(), call)));
                 }
                 call = asset_call_rx.recv() => {
                     let Some(call) = call else {

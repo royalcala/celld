@@ -196,6 +196,22 @@ pub fn set_rpc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcCallReq>) {
     let _ = RPC_CALL_TX.set(tx);
 }
 
+/// An operation on an RPC target that a Durable Object isolate exported to
+/// another isolate. The cell scope routes it back to the owning isolate. A
+/// `None` path disposes the target; `None` args is a property get.
+pub struct StubRpcReq {
+    pub scope: String,
+    pub id: u64,
+    pub path: Option<Vec<String>>,
+    pub args: Option<Vec<u8>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+}
+pub(crate) static STUB_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<StubRpcReq>> =
+    OnceLock::new();
+pub fn set_stub_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<StubRpcReq>) {
+    let _ = STUB_RPC_TX.set(tx);
+}
+
 static OUTBOUND_WS_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>> =
     OnceLock::new();
 pub fn set_outbound_ws_tx(tx: tokio::sync::mpsc::UnboundedSender<OutboundWsReq>) {

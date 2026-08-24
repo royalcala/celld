@@ -4219,6 +4219,18 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
         (typeof v !== "object" && typeof v !== "function")) return v;
     const cached = seen.get(v);
     if (cached !== undefined) return cached;
+    const remote = __remoteStubMeta.get(v);
+    if (remote) {
+      if (!allowCapabilities) return v;
+      if (remote.disposed) throw __stubDisposedError();
+      lifted = true;
+      caps = true;
+      const marker = { "__celld$stub": remote.id,
+                       t: remote.isolate, c: remote.callable,
+                       s: remote.scope };
+      seen.set(v, marker);
+      return marker;
+    }
     const meta = __stubMeta.get(v);
     if (meta) {
       if (!allowCapabilities) return v;
@@ -4231,7 +4243,8 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
       const marker = { "__celld$stub": meta.entry.id,
-                       t: __stubIsolate, c: meta.callable };
+                       t: __stubIsolate, c: meta.callable,
+                       s: meta.entry.scope };
       seen.set(v, marker);
       return marker;
     }
@@ -4260,9 +4273,11 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
+      const entry = __newEntry(v);
+      const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
-                       c: typeof v === "function" };
+                       c: typeof v === "function",
+                       s: entry.scope };
       seen.set(v, marker);
       return marker;
     }
@@ -4465,7 +4480,7 @@ const __stubRevive = (value) => {
       const entry = v.t === __stubIsolate
         ? __stubEntries.get(stubId) : undefined;
       const stub = entry === undefined
-        ? __foreignStub()
+        ? __foreignStub(v.s, stubId, v.c, v.t)
         : __makeStub(entry, v.c);
       const meta = __stubMeta.get(stub);
       if (meta) handles.push(meta);
@@ -4521,15 +4536,38 @@ const __stubRevive = (value) => {
   return { value: revive(value), handles, disposers };
 };
 // A marker that crossed an isolate boundary: fail on use, loudly.
-const __foreignStub = () => new Proxy(function () {}, {
-  get: (_b, prop) => {
-    if (prop === "then" || typeof prop !== "string") return undefined;
-    return () => Promise.reject(new Error(
-      "RPC stubs cannot cross isolate boundaries yet."));
-  },
-  apply: () => Promise.reject(new Error(
-    "RPC stubs cannot cross isolate boundaries yet.")),
-});
+const __remoteStubMeta = new WeakMap();
+const __remoteStubOp = async (meta, path, args) => {
+  if (meta.disposed) throw __stubDisposedError();
+  if (meta.scope === undefined)
+    throw new Error("RPC stubs without a Durable Object owner cannot cross isolate boundaries yet.");
+  const encoded = args === null ? null : __rpcOut(args, true);
+  const result = __rpcDes(await __stub_rpc_call(
+    meta.scope, meta.id, JSON.stringify(path), encoded));
+  if (path === null) meta.disposed = true;
+  return result;
+};
+const __foreignStub = (scope, id, callable, isolate) => {
+  const meta = { scope, id, callable, isolate, disposed: false };
+  const session = {
+    get: (path) => __remoteStubOp(meta, path, null),
+    call: (path, args) => __remoteStubOp(meta, path, args),
+  };
+  const stub = new Proxy(function () {}, {
+    getPrototypeOf: () => __cf.RpcStub.prototype,
+    get: (_b, prop) => {
+      if (prop === "then") return undefined;
+      if (prop === Symbol.dispose)
+        return () => { void __remoteStubOp(meta, null, null); };
+      if (typeof prop !== "string") return undefined;
+      return __makeNode(session, [prop], __ctxNow());
+    },
+    apply: (_b, _this, args) => __makeNode(
+      __valueSession(__remoteStubOp(meta, [], args)), [], __ctxNow()),
+  });
+  __remoteStubMeta.set(stub, meta);
+  return stub;
+};
 // Workerd's entrypoint method-visibility rules (worker-rpc.c++):
 // reserved lifecycle names are refused outright; only prototype
 // methods and accessors are visible -- never own instance state
@@ -5440,6 +5478,37 @@ __celld.__dispatchRpc = async (scope, method, args) => {
         }, true);
       } finally {
         for (const handle of decoded.received) __disposeStub(handle);
+      }
+    })());
+  } finally {
+    __endActorEvent(actorEvent);
+  }
+};
+// An operation on an RPC target that this isolate's Durable Object exported
+// to another isolate (the far side's __foreignStub routes it here by scope).
+// A `null` path disposes the target.
+__celld.__dispatchStubRpc = async (id, pathJson, args) => {
+  const entry = __stubEntries.get(id);
+  if (entry === undefined)
+    return __rpcErrOut(new Error("RPC target is no longer available."));
+  const path = JSON.parse(pathJson);
+  const actorEvent = __beginActorEvent(entry.scope);
+  try {
+    return await __ctxRun(entry.ctx, () => (async () => {
+      const decoded = args === null ? null : __rpcDesArgs(args);
+      try {
+        return await __rpcRun(() => {
+          if (path === null) {
+            __disposeStub({ entry, disposed: false, ctx: undefined });
+            return undefined;
+          }
+          return __rpcWalk(entry.target, path,
+            decoded === null ? null : decoded.args, false);
+        }, true);
+      } finally {
+        if (decoded !== null)
+          for (const handle of decoded.received)
+            __disposeStub(handle);
       }
     })());
   } finally {
