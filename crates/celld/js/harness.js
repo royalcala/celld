@@ -2866,6 +2866,27 @@ class DurableObjectState {
   waitUntil(promise) {
     __registerWaitUntil(promise);
   }
+  // Workerd's persistent stubs: `ctx.restore(params)` returns a stub to
+  // what this object's `[restore](params)` method builds. Cells calls the
+  // method at once and returns a live stub; it can't yet store such a stub
+  // and revive it later by calling `[restore]` again.
+  async restore(params) {
+    const inst = __cell.instances[this._scope];
+    const method = inst?.[__cf.restore];
+    if (typeof method !== "function")
+      throw new TypeError(
+        "ctx.restore() requires the Durable Object class to define a " +
+        "[restore]() method.");
+    const target = await method.call(inst, params);
+    // Stubs of every brand (RPC, service, Durable Object) pass through
+    // as-is; a stub proxy is callable, so check them before functions.
+    if (__stubMeta.has(target) || __svcMeta.has(target) ||
+        __doStubMeta.has(target))
+      return target;
+    if (target instanceof __cf.RpcTarget || typeof target === "function")
+      return new __cf.RpcStub(target);
+    return target;
+  }
 }
 function _instance(scope) {
   let inst = __cell.instances[scope];
@@ -9718,6 +9739,10 @@ const __cf = __celld.__cf = {
   },
   exports: {},
   get env() { return __cell.env; },
+  tracing: __tracing,
+  // Key for a Durable Object's `[restore](params)` method; see
+  // DurableObjectState.restore.
+  restore: Symbol.for("cloudflare:workers.restore"),
 };
 // Proxy standing in for unsupported node:*/cloudflare:* builtins. Property
 // walks stay inert -- real bundles reference these at module scope, and
