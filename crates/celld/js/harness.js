@@ -4598,8 +4598,10 @@ const __entrypointResolve = (inst, prop) => {
   if (__entrypointReserved.has(prop))
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
-  if (Object.hasOwn(inst, prop) || !(prop in inst) ||
-      prop in Object.prototype)
+  // A constructor may return a get-only Proxy that forwards to another stub
+  // (as an RpcTarget can be); see __stubResolve.
+  if (Object.hasOwn(inst, prop) || prop in Object.prototype ||
+      (!(prop in inst) && inst[prop] === undefined))
     throw __rpcNoSuchMethod(prop);
   const value = inst[prop];
   return typeof value === "function" && !__stubMeta.has(value) &&
