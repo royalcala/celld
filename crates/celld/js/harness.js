@@ -2096,6 +2096,21 @@ const __blockLeave = (scope, block, event) => {
 };
 const __durableClassMeta = new WeakMap();
 let __nextFacetOwner = 1;
+// Facet stubs are proxies over a plain object, so they don't serialize as
+// stubs on their own; DurableObjectState.restore wraps them.
+const __facetStubs = new WeakSet();
+// An RpcTarget that forwards every method name to `inner`, so a loopback
+// stub over it exposes all of a facet stub's methods.
+const __forwardingRpcTarget = (inner) =>
+  new Proxy(new __cf.RpcTarget(), {
+    has: (base, prop) => typeof prop === "string" &&
+      !(prop in Object.prototype) || Reflect.has(base, prop),
+    get: (base, prop, receiver) =>
+      typeof prop === "string" && prop !== "then" &&
+        !(prop in Object.prototype) && !Object.hasOwn(base, prop)
+        ? inner[prop]
+        : Reflect.get(base, prop, receiver),
+  });
 // Takes encoded props, not the caller's options bag: an options bag reaching
 // here is a bag nothing validated, and reading one key out of it is how every
 // other key came to be dropped in silence. The loader stub validates the bag
@@ -2233,6 +2248,7 @@ class DurableObjectFacets {
         return __makeNode(session, [prop], null);
       },
     });
+    __facetStubs.add(record.stub);
     this._running.set(name, record);
     return record.stub;
   }
@@ -2883,6 +2899,8 @@ class DurableObjectState {
     if (__stubMeta.has(target) || __svcMeta.has(target) ||
         __doStubMeta.has(target))
       return target;
+    if (__facetStubs.has(target))
+      return new __cf.RpcStub(__forwardingRpcTarget(target));
     if (target instanceof __cf.RpcTarget || typeof target === "function")
       return new __cf.RpcStub(target);
     return target;
