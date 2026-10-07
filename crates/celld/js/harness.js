@@ -5380,11 +5380,14 @@ class DurableObjectNamespace {
       // target. Same-process dispatch re-enters this isolate, where the
       // abort and exit markers revive; bytes that land elsewhere revive as
       // loud foreign stubs.
-      return async (...args) => invoke(
+      // The call returns an RpcPromise, as in Workerd, so a caller can
+      // pipeline through the result before awaiting it
+      // (`stub.open().method()`, or a Proxy that forwards to it).
+      return (...args) => __makeNode(__valueSession(invoke(
         async () => __rpcDes(await __rpc_call(
           scope, dispatchName ?? null, prop, __rpcOut(args, true),
         )),
-      );
+      )), [], __ctxNow());
     }});
     __doStubMeta.set(stub, id);
     return stub;
