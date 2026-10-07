@@ -314,6 +314,14 @@ impl Slot {
         Self::outside_pool(worker, true)
     }
 
+    /// Whether this slot still holds its isolate. A retiring slot frees its
+    /// isolate once drained, but the slot itself can outlive that, so a
+    /// caller that kept a reference must check this (while affiliated, so it
+    /// cannot be freed in between) before entering it.
+    pub async fn is_live(&self) -> bool {
+        self.worker.lock().await.is_some()
+    }
+
     /// A slot holding a Worker outside a placement pool.
     ///
     /// A dynamic Worker owns exactly one isolate, so it needs no

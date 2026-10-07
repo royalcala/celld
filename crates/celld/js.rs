@@ -9184,11 +9184,16 @@ fn op_stub_rpc_call_heap(
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     let op = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let slot = slot.ok_or_else(|| {
-            "RPC target's isolate is gone, or is on another celld node.".to_string()
-        })?;
-        if slot.is_retiring() {
-            return Err("RPC target's isolate is retiring.".to_string());
+        // A retiring isolate takes no new admissions, but it keeps serving the
+        // connections it already holds (a WebSocket session), and the target
+        // belongs to one of them. Only a freed isolate is gone.
+        let gone = || "RPC target's isolate is gone, or is on another celld node.".to_string();
+        let slot = slot.ok_or_else(gone)?;
+        // Affiliate before checking, so the pool can't free the isolate
+        // between the check and the drive; held until the call is done.
+        let _hold = slot.affiliate();
+        if !slot.is_live().await {
+            return Err(gone());
         }
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::StubRpc {
