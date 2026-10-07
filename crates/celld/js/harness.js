@@ -2197,7 +2197,7 @@ class DurableObjectFacets {
             "Pipelined property paths on facets are not supported yet.");
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          propsSc, path[0], __rpcOut(args, false)));
+          propsSc, path[0], __rpcOut(args, true)));
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -3299,7 +3299,7 @@ __celld.__makeLoader = () => {
             "yet.");
         const { id } = await loadPromise;
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false),
+          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, true),
             propsSc, limitsJson));
       })(),
     };
