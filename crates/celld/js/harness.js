@@ -4017,8 +4017,12 @@ const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
   if (target instanceof __cf.RpcTarget) {
-    if (Object.hasOwn(target, prop) || !(prop in target) ||
-        prop in Object.prototype) throw __rpcNoSuchMethod(prop);
+    // A Proxy RpcTarget with only a `get` trap (forwarding to another
+    // stub) answers `in` from its bare target, so a miss there falls back
+    // to reading the property, as Workerd's lookup does.
+    if (Object.hasOwn(target, prop) || prop in Object.prototype ||
+        (!(prop in target) && target[prop] === undefined))
+      throw __rpcNoSuchMethod(prop);
   } else if (!Object.hasOwn(target, prop)) {
     throw __rpcNoSuchMethod(prop);
   }
