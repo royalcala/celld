@@ -257,6 +257,9 @@ pub enum WorkerJob {
         /// Service Binding can set it.
         props: Vec<u8>,
         invocation_limits: Option<WorkerInvocationLimits>,
+        /// Receives the invocation report for a Dynamic Worker's tails, as
+        /// for `Fetch`. Other RPC leaves this empty.
+        tail_report: Option<tokio::sync::oneshot::Sender<String>>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     Queue {

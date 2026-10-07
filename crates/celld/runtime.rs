@@ -2931,6 +2931,7 @@ impl StatelessRuntime {
             operation,
             props,
             invocation_limits: None,
+            tail_report: None,
             reply,
         })
         .await

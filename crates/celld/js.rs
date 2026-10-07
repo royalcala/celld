@@ -2961,6 +2961,9 @@ struct TailReportState {
     headers: serde_json::Map<String, serde_json::Value>,
     response_status: Option<u16>,
     failure: Option<TailException>,
+    /// Set for an entrypoint RPC, whose trace event is `{ rpcMethod }`
+    /// rather than a request; `url`, `method` and `headers` are then empty.
+    rpc_method: Option<String>,
 }
 
 /// A failure and the instant it occurred. Tail delivery can wait for
@@ -3016,9 +3019,9 @@ impl TailReportState {
             "ok"
         };
         let exceptions: Vec<_> = self.failure.into_iter().collect();
-        let event = serde_json::json!([{
-            "scriptName": self.script_name,
-            "event": {
+        let event_info = match self.rpc_method {
+            Some(rpc_method) => serde_json::json!({ "rpcMethod": rpc_method }),
+            None => serde_json::json!({
                 "request": {
                     "cf": {},
                     "headers": self.headers,
@@ -3028,7 +3031,11 @@ impl TailReportState {
                 "response": self.response_status.map(|status| serde_json::json!({
                     "status": status,
                 })),
-            },
+            }),
+        };
+        let event = serde_json::json!([{
+            "scriptName": self.script_name,
+            "event": event_info,
             "eventTimestamp": self.event_timestamp,
             "logs": context.take_tail_logs(),
             "exceptions": exceptions,
@@ -4537,6 +4544,7 @@ fn begin<'s>(
             operation,
             props,
             invocation_limits,
+            tail_report,
             reply,
         } => {
             return begin_entrypoint_rpc(
@@ -4545,6 +4553,7 @@ fn begin<'s>(
                 operation,
                 props,
                 invocation_limits,
+                tail_report,
                 reply,
             );
         }
@@ -4610,6 +4619,7 @@ fn begin<'s>(
         headers: tail_headers,
         response_status: None,
         failure: None,
+        rpc_method: None,
     });
     let promise = match started {
         Ok(Started::Running(ret, active)) => match ret.try_cast::<v8::Promise>() {
@@ -4760,12 +4770,32 @@ fn begin_entrypoint_rpc(
     operation: crate::WorkerRpcOperation,
     props: Vec<u8>,
     invocation_limits: Option<ResourceLimits>,
+    tail_report: Option<tokio::sync::oneshot::Sender<String>>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
-    let context = IoContext::with_resource_limits(effective_resource_limits(
-        actor_runtime_state(tc).resource_limits,
-        invocation_limits,
-    ));
+    let runtime_state = actor_runtime_state(tc);
+    // As for a fetch: a Dynamic Worker loaded with tails reports each call,
+    // with the logs it captured, as an `rpcMethod` trace event.
+    let context = IoContext::with_options(
+        effective_resource_limits(runtime_state.resource_limits, invocation_limits),
+        tail_report.is_some(),
+    );
+    let rpc_method = match &operation {
+        crate::WorkerRpcOperation::Get { path } | crate::WorkerRpcOperation::Call { path, .. } => {
+            path.join(".")
+        }
+    };
+    let mut tail_report = tail_report.map(|reply| TailReportState {
+        reply,
+        script_name: runtime_state.script_name.clone(),
+        event_timestamp: unix_now_ms(),
+        url: String::new(),
+        method: String::new(),
+        headers: serde_json::Map::new(),
+        response_status: None,
+        failure: None,
+        rpc_method: Some(rpc_method),
+    });
     let guard = CurrentGuard::enter(context.clone());
     context.begin_cpu_turn();
     let started = (|| {
@@ -4821,7 +4851,7 @@ fn begin_entrypoint_rpc(
                 started: event_started,
                 trace: None,
                 failure: None,
-                tail_report: None,
+                tail_report,
             };
             drop(guard);
             Begun::Running(Box::new(entry))
@@ -4832,6 +4862,10 @@ fn begin_entrypoint_rpc(
             let error = take_execution_termination(tc)
                 .or(cpu_error)
                 .unwrap_or(error);
+            if let Some(mut report) = tail_report.take() {
+                report.record_failure(format!("{error:#}"));
+                report.finish(&context);
+            }
             drop(guard);
             let _ = reply.send(Err(error));
             Begun::Nothing
@@ -8013,6 +8047,15 @@ fn op_loader_rpc(
         Ok(limits) => limits,
         Err(error) => return loader_throw(scope, &error),
     };
+    // As in `op_loader_fetch`: a Worker loaded with tails answers
+    // `[result, report]`.
+    let want_tail_report = args.get(6).boolean_value(scope);
+    let (tail_report, tail_receive) = if want_tail_report {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        (Some(send), Some(receive))
+    } else {
+        (None, None)
+    };
     // The props ride on `WorkerJob::Rpc` for the whole call, so an unbounded
     // value is an unbounded per-call allocation in the host. The harness checks
     // nothing here: it runs in the calling worker's isolate beside the
@@ -8037,6 +8080,7 @@ fn op_loader_rpc(
             },
             props,
             invocation_limits,
+            tail_report,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
@@ -8049,7 +8093,19 @@ fn op_loader_rpc(
             },
         }
     });
-    rv.set(promise_for(scope, async_id));
+    let result = promise_for(scope, async_id);
+    let Some(tail_receive) = tail_receive else {
+        rv.set(result);
+        return;
+    };
+    let report_id = asyncrt::enqueue(async move {
+        tail_receive
+            .await
+            .map_err(|error| format!("loaded worker dropped tail report: {error}"))
+    });
+    let report = promise_for(scope, report_id);
+    let pair = v8::Array::new_with_elements(scope, &[result, report]);
+    rv.set(pair.into());
 }
 
 fn facet_scope(class_name: &str, parent_scope: &str, owner: &str, name: &str) -> String {
