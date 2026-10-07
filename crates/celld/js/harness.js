@@ -4567,14 +4567,39 @@ const __remoteStubOp = async (meta, path, args) => {
     throw new Error("RPC stubs without a Durable Object owner cannot cross isolate boundaries yet.");
   const encoded = args === null ? null : __rpcOut(args, true);
   const pathJson = JSON.stringify(path);
-  const result = __rpcDes(await (meta.scope !== undefined
-    ? __stub_rpc_call(meta.scope, meta.id, pathJson, encoded)
-    : __stub_rpc_call_heap(meta.heap, meta.id, pathJson, encoded)));
+  let result;
+  try {
+    result = __rpcDes(await (meta.scope !== undefined
+      ? __stub_rpc_call(meta.scope, meta.id, pathJson, encoded)
+      : __stub_rpc_call_heap(meta.heap, meta.id, pathJson, encoded)));
+  } catch (error) {
+    if (__ownerGone(error)) __foreignBroken(meta.shared, error);
+    throw error;
+  }
   if (path === null) meta.disposed = true;
   return result;
 };
-const __foreignStub = (scope, id, callable, isolate, heap) => {
-  const meta = { scope, id, callable, isolate, heap, disposed: false };
+// The owner's entry or isolate no longer exists: the connection behind the
+// stub is broken, as Workerd's onRpcBroken reports it.
+const __ownerGone = (error) => {
+  const message = String(error?.message ?? error);
+  return message.includes("RPC target is no longer available") ||
+    message.includes("RPC target's isolate is gone") ||
+    message.includes("RPC target's isolate is retiring");
+};
+const __foreignBroken = (shared, error) => {
+  if (shared.broken) return;
+  shared.broken = true;
+  for (const handler of shared.onBroken.splice(0)) {
+    try { handler(error); } catch {}
+  }
+};
+// `shared` is common to a stub and its dup()s: they hold one reference on
+// the owner, released when the last of them is disposed.
+const __foreignStub = (scope, id, callable, isolate, heap,
+    shared = { refs: 1, broken: false, onBroken: [] }) => {
+  const meta =
+    { scope, id, callable, isolate, heap, disposed: false, shared };
   const session = {
     get: (path) => __remoteStubOp(meta, path, null),
     call: (path, args) => __remoteStubOp(meta, path, args),
@@ -4584,7 +4609,22 @@ const __foreignStub = (scope, id, callable, isolate, heap) => {
     get: (_b, prop) => {
       if (prop === "then") return undefined;
       if (prop === Symbol.dispose)
-        return () => { void __remoteStubOp(meta, null, null); };
+        return () => {
+          if (meta.disposed) return;
+          if (--shared.refs > 0) { meta.disposed = true; return; }
+          void __remoteStubOp(meta, null, null).catch(() => {});
+        };
+      if (prop === "dup") return () => {
+        if (meta.disposed) throw __stubDisposedError();
+        shared.refs++;
+        return __foreignStub(scope, id, callable, isolate, heap, shared);
+      };
+      if (prop === "onRpcBroken") return (handler) => {
+        if (typeof handler !== "function") return;
+        if (shared.broken) queueMicrotask(() => handler(
+          new Error("RPC target is no longer available.")));
+        else shared.onBroken.push(handler);
+      };
       if (typeof prop !== "string") return undefined;
       return __makeNode(session, [prop], __ctxNow());
     },
@@ -4862,6 +4902,8 @@ const __makeStub = (entry, callable) => {
         entry.refs++;
         return __makeStub(entry, callable);
       };
+      // A same-isolate target can't disconnect; accept and keep nothing.
+      if (prop === "onRpcBroken") return () => {};
       if (typeof prop !== "string") return undefined;
       return __makeNode(__stubSession(meta), [prop], __ctxNow());
     },
