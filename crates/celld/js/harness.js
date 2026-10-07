@@ -10194,9 +10194,11 @@ if (!globalThis.Blob) {
     async arrayBuffer() { return this._bytes.slice().buffer; }
     async bytes() { return this._bytes.slice(); }
     async text() { return new TextDecoder().decode(this._bytes); }
+    // A byte stream, as in Workerd, so BYOB readers work on it.
     stream() {
       const bytes = this._bytes;
       return new ReadableStream({
+        type: "bytes",
         start(controller) {
           if (bytes.byteLength) controller.enqueue(bytes.slice());
           controller.close();
