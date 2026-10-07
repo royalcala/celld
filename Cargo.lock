@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "celld"
-version = "0.6.1-rpc-targets.11"
+version = "0.6.1-rpc-targets.4"
 dependencies = [
  "aes",
  "aes-gcm",

@@ -9706,6 +9706,29 @@ class Workflow {
 
 const __makeWorkflow = __celld.__makeWorkflow =
   (workflowName) => new Workflow(workflowName);
+// Workerd's user tracing API (`ctx.tracing` and `cloudflare:workers`
+// `tracing`). Cells exports no traces, so every span is untraced: callbacks
+// run as-is and span methods are no-ops.
+class __Span {
+  get isTraced() { return false; }
+  setAttribute() { return this; }
+  setAttributes() { return this; }
+  recordException() {}
+  updateName() { return this; }
+  setStatus() { return this; }
+  end() {}
+}
+const __tracing = {
+  enterSpan(_name, callback, ...args) {
+    return callback(new __Span(), ...args);
+  },
+  startActiveSpan(_name, callback, ...args) {
+    return callback(new __Span(), ...args);
+  },
+  startSpan() { return new __Span(); },
+  getActiveSpan() { return undefined; },
+  Span: __Span,
+};
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 const __cf = __celld.__cf = {
@@ -11193,6 +11216,7 @@ const __entrypointContext = (props = __defaultProps) => ({
   passThroughOnException() {},
   abort: __ctxAbortCurrent,
   props,
+  tracing: __tracing,
   get exports() { return __ctxExports(); },
 });
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
