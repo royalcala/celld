@@ -4212,7 +4212,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::StubRpc { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4551,6 +4551,14 @@ fn begin<'s>(
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
+        crate::WorkerJob::StubRpc {
+            id,
+            path,
+            args,
+            reply,
+        } => {
+            return begin_stub_rpc(tc, id, path, args, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -4668,6 +4676,84 @@ fn begin<'s>(
 /// promise, and let `drive` pump it with no isolate held across the awaits.
 /// The old dispatcher blocked until the promise settled, which is why RPC
 /// needed a thread of its own and why `WorkerPool` outlived the fetch path.
+/// Start an operation on an RPC target that this stateless isolate exported
+/// to another isolate: `__dispatchStubRpc` runs it under the request context
+/// that exported it. Shaped like `begin_entrypoint_rpc`.
+fn begin_stub_rpc(
+    tc: &mut v8::PinScope,
+    id: u64,
+    path: Option<Vec<String>>,
+    args: Option<Vec<u8>>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::with_resource_limits(effective_resource_limits(
+        actor_runtime_state(tc).resource_limits,
+        None,
+    ));
+    let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
+    let started = (|| {
+        let f = internal_function(tc, "__dispatchStubRpc")?;
+        let path = v8::String::new(tc, &serde_json::to_string(&path)?).unwrap();
+        let args = match args {
+            Some(args) => bytes_value(tc, args),
+            None => v8::null(tc).into(),
+        };
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(
+                tc,
+                recv,
+                &[v8::Number::new(tc, id as f64).into(), path.into(), args],
+            )
+            .ok_or_else(|| anyhow!("dispatchStubRpc threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    let event_started = Instant::now();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
 fn begin_entrypoint_rpc(
     tc: &mut v8::PinScope,
     entrypoint: &str,
@@ -6856,6 +6942,8 @@ ops! { OP_NAMES, install_op_functions,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
         "__stub_rpc_call" => op_stub_rpc_call,
+        "__stub_rpc_call_heap" => op_stub_rpc_call_heap,
+        "__stub_owner_heap" => op_stub_owner_heap,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -9047,6 +9135,76 @@ fn op_stub_rpc_call(
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(error)) => Err(format!("{error}")),
             Err(error) => Err(format!("stub RPC proxy dropped: {error}")),
+        }
+    });
+    rv.set(promise_for(scope, op));
+}
+
+/// The stateless isolates that exported RPC targets to other isolates, by
+/// heap id. Weak, so a marker cannot keep a retired isolate alive; a call to
+/// one that is gone fails instead.
+static STUB_OWNER_SLOTS: OnceLock<Mutex<HashMap<String, std::sync::Weak<crate::pool::Slot>>>> =
+    OnceLock::new();
+
+/// `__stub_owner_heap()` registers the isolate running this turn as the
+/// owner of RPC targets it exports, and answers its heap id (as a string).
+fn op_stub_owner_heap(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(slot) = crate::pool::current_slot() else {
+        return;
+    };
+    let heap = slot.heap_id().to_string();
+    let mut slots = STUB_OWNER_SLOTS.get_or_init(Mutex::default).lock().unwrap();
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    slots.insert(heap.clone(), Arc::downgrade(&slot));
+    rv.set(v8::String::new(scope, &heap).unwrap().into());
+}
+
+/// `__stub_rpc_call_heap(heap, id, pathJson, argsScOrNull)` routes an RPC
+/// target operation back to the stateless isolate that exported the target,
+/// as a new event there. Same-node only: the isolate's memory holds it.
+fn op_stub_rpc_call_heap(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let heap = args.get(0).to_rust_string_lossy(scope);
+    let id = args.get(1).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let path: Option<Vec<String>> =
+        serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)).unwrap_or_default();
+    let args_value = args.get(3);
+    let call_args =
+        (!args_value.is_null_or_undefined()).then(|| view_bytes(args_value).unwrap_or_default());
+    let slot = STUB_OWNER_SLOTS
+        .get()
+        .and_then(|slots| slots.lock().unwrap().get(&heap).and_then(|slot| slot.upgrade()));
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let op = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        let slot = slot.ok_or_else(|| {
+            "RPC target's isolate is gone, or is on another celld node.".to_string()
+        })?;
+        if slot.is_retiring() {
+            return Err("RPC target's isolate is retiring.".to_string());
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::StubRpc {
+            id,
+            path,
+            args: call_args,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("stub RPC task died: {error}")),
+                Ok(()) => Err("stub RPC owner dropped its result".to_string()),
+            },
         }
     });
     rv.set(promise_for(scope, op));

@@ -198,7 +198,9 @@ impl StatelessWorkerJob {
             crate::WorkerJob::Fetch { request_id, .. } => {
                 request_id.map(RequestCancellationLifetime::from_request_id)
             }
-            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Rpc { .. }
+            | crate::WorkerJob::Queue { .. }
+            | crate::WorkerJob::StubRpc { .. } => None,
         };
         let cancellation = RequestCancellationGuard::new(lifetime);
         Self { job, cancellation }
@@ -2654,7 +2656,7 @@ impl StatelessTiming {
                 "celld.queue",
                 crate::telemetry::KIND_CONSUMER,
             ),
-            crate::WorkerJob::Rpc { .. } => (
+            crate::WorkerJob::Rpc { .. } | crate::WorkerJob::StubRpc { .. } => (
                 Instant::now(),
                 None,
                 "celld.fetch",

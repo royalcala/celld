@@ -4227,7 +4227,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       caps = true;
       const marker = { "__celld$stub": remote.id,
                        t: remote.isolate, c: remote.callable,
-                       s: remote.scope };
+                       s: remote.scope, h: remote.heap };
       seen.set(v, marker);
       return marker;
     }
@@ -4244,7 +4244,8 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       __ctxUnregister(meta);
       const marker = { "__celld$stub": meta.entry.id,
                        t: __stubIsolate, c: meta.callable,
-                       s: meta.entry.scope };
+                       s: meta.entry.scope,
+                       h: __stubOwnerHeap(meta.entry.scope) };
       seen.set(v, marker);
       return marker;
     }
@@ -4277,7 +4278,8 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
                        c: typeof v === "function",
-                       s: entry.scope };
+                       s: entry.scope,
+                       h: __stubOwnerHeap(entry.scope) };
       seen.set(v, marker);
       return marker;
     }
@@ -4480,7 +4482,7 @@ const __stubRevive = (value) => {
       const entry = v.t === __stubIsolate
         ? __stubEntries.get(stubId) : undefined;
       const stub = entry === undefined
-        ? __foreignStub(v.s, stubId, v.c, v.t)
+        ? __foreignStub(v.s, stubId, v.c, v.t, v.h)
         : __makeStub(entry, v.c);
       const meta = __stubMeta.get(stub);
       if (meta) handles.push(meta);
@@ -4535,20 +4537,32 @@ const __stubRevive = (value) => {
   };
   return { value: revive(value), handles, disposers };
 };
-// A marker that crossed an isolate boundary: fail on use, loudly.
+// A marker that crossed an isolate boundary. Operations on it route back
+// to the owner: a Durable Object by its cell scope, or else the stateless
+// isolate that exported it, by heap id, while that isolate is alive.
 const __remoteStubMeta = new WeakMap();
+// This isolate's heap id, for markers of targets no Durable Object owns.
+// Registered with the host on first use; constant for the isolate's life.
+let __ownHeap;
+const __stubOwnerHeap = (scope) => {
+  if (scope !== undefined) return undefined;
+  if (__ownHeap === undefined) __ownHeap = __stub_owner_heap();
+  return __ownHeap;
+};
 const __remoteStubOp = async (meta, path, args) => {
   if (meta.disposed) throw __stubDisposedError();
-  if (meta.scope === undefined)
+  if (meta.scope === undefined && meta.heap === undefined)
     throw new Error("RPC stubs without a Durable Object owner cannot cross isolate boundaries yet.");
   const encoded = args === null ? null : __rpcOut(args, true);
-  const result = __rpcDes(await __stub_rpc_call(
-    meta.scope, meta.id, JSON.stringify(path), encoded));
+  const pathJson = JSON.stringify(path);
+  const result = __rpcDes(await (meta.scope !== undefined
+    ? __stub_rpc_call(meta.scope, meta.id, pathJson, encoded)
+    : __stub_rpc_call_heap(meta.heap, meta.id, pathJson, encoded)));
   if (path === null) meta.disposed = true;
   return result;
 };
-const __foreignStub = (scope, id, callable, isolate) => {
-  const meta = { scope, id, callable, isolate, disposed: false };
+const __foreignStub = (scope, id, callable, isolate, heap) => {
+  const meta = { scope, id, callable, isolate, heap, disposed: false };
   const session = {
     get: (path) => __remoteStubOp(meta, path, null),
     call: (path, args) => __remoteStubOp(meta, path, args),
@@ -5484,15 +5498,20 @@ __celld.__dispatchRpc = async (scope, method, args) => {
     __endActorEvent(actorEvent);
   }
 };
-// An operation on an RPC target that this isolate's Durable Object exported
-// to another isolate (the far side's __foreignStub routes it here by scope).
-// A `null` path disposes the target.
+// An operation on an RPC target that this isolate exported to another
+// isolate (the far side's __foreignStub routes it here: by cell scope for a
+// Durable Object's target, by heap id for a stateless one). A `null` path
+// disposes the target. A stateless target runs in the request context that
+// exported it, so it can still use that request's I/O objects.
 __celld.__dispatchStubRpc = async (id, pathJson, args) => {
   const entry = __stubEntries.get(id);
   if (entry === undefined)
     return __rpcErrOut(new Error("RPC target is no longer available."));
+  if (__abortedCtxs.size && __abortedCtxs.has(entry.ctx))
+    return __rpcErrOut(__postAbortError(__abortedCtxs.get(entry.ctx)));
   const path = JSON.parse(pathJson);
-  const actorEvent = __beginActorEvent(entry.scope);
+  const actorEvent = entry.scope === undefined
+    ? undefined : __beginActorEvent(entry.scope);
   try {
     return await __ctxRun(entry.ctx, () => (async () => {
       const decoded = args === null ? null : __rpcDesArgs(args);
@@ -5512,7 +5531,7 @@ __celld.__dispatchStubRpc = async (id, pathJson, args) => {
       }
     })());
   } finally {
-    __endActorEvent(actorEvent);
+    if (actorEvent !== undefined) __endActorEvent(actorEvent);
   }
 };
 const __entrypointClass = (name) => {
