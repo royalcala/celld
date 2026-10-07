@@ -4278,7 +4278,15 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       lifted = true;
       caps = true;
-      const entry = __newEntry(v);
+      // A stub of another RPC system (a capnweb stub is a function proxy
+      // with its own dup()) is disposed by its owner when the call that
+      // passed it returns. Keep a duplicate, as workerd does under
+      // rpc_params_dup_stubs (the default since 2026-01-20).
+      let target = v;
+      try {
+        if (typeof v.dup === "function") target = v.dup();
+      } catch {}
+      const entry = __newEntry(target);
       const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
                        c: typeof v === "function",
