@@ -39,6 +39,7 @@ mod asyncrt_contract_tests {
     include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
 }
 pub mod bucket;
+pub mod capability;
 pub mod cell_cli;
 pub mod cell_dispatch;
 mod cell_host;
