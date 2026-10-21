@@ -1465,6 +1465,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     // Use the caller's id so its abort, published when the
                     // caller's host op is dropped, reaches this cell event.
                     let local_request_id = local_dispatch_request_id(request_id);
+                    let started = std::time::Instant::now();
                     let completed = app
                         .local_request(request, dispatch_scope.clone(), local_request_id, "local")
                         .run(async {
@@ -1475,7 +1476,22 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                                 .await
                         })
                         .await;
-                    return Ok(completed.result.map_err(local_request_error)?.data);
+                    let labels = [("transport", "local")];
+                    celld::observability::inc("celld_rpc_calls_total", &labels);
+                    celld::observability::observe(
+                        "celld_rpc_duration_seconds",
+                        &labels,
+                        started.elapsed().as_secs_f64(),
+                    );
+                    return match completed.result {
+                        Ok(outcome) => Ok(outcome.data),
+                        Err(error) => {
+                            let error = local_request_error(error);
+                            let code = celld::js::classify_owner_error(&error.to_string());
+                            celld::observability::inc("celld_rpc_errors_total", &[("code", code)]);
+                            Err(error)
+                        }
+                    };
                 }
                 Route::Remote {
                     node,
@@ -1501,6 +1517,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 "peer {node} speaks incompatible protocol {peer_protocol}"
             );
             let expects_structured_response = matches!(args, celld::js::RpcData::V8(_));
+            let started = std::time::Instant::now();
             {
                 let peer = peer_tunnel::Peer {
                     http: &app.peer_http,
@@ -1534,6 +1551,13 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     }
                     None => forwarded.await,
                 };
+                let labels = [("transport", "remote")];
+                celld::observability::inc("celld_rpc_calls_total", &labels);
+                celld::observability::observe(
+                    "celld_rpc_duration_seconds",
+                    &labels,
+                    started.elapsed().as_secs_f64(),
+                );
                 // Classify failures before response decoding. An explicit stale
                 // owner ran nothing; a failed or truncated reply after execution
                 // remains ambiguous and cannot justify another RPC invocation.
@@ -2963,6 +2987,7 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/metrics" => response(StatusCode::OK, celld::observability::render()),
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }

@@ -123,6 +123,38 @@ if grep -qF "$TOKEN" "$DIR/secrets-ok.log"; then
 fi
 echo "   token and 32-byte secret_key served; no secret in node log"
 
+echo "== request id, spans, RPC/stream metrics"
+RID="e2e-$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+curl -fsS -D "$DIR/trace.headers" -H "x-celld-request-id: $RID" \
+  "http://127.0.0.1:$port/trace" > "$DIR/trace.json"
+grep -qi "^x-celld-request-id: $RID" "$DIR/trace.headers" \
+  || { echo "FAIL: response is missing the request id" >&2; exit 1; }
+python3 - "$DIR/trace.json" "$RID" <<'PY' || exit 1
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc.get("traced") is True, doc
+assert doc.get("name") == "e2e-span", doc
+assert doc.get("requestId") == sys.argv[2], doc
+PY
+[ "$(curl -fsS "http://127.0.0.1:$port/rpc")" = "pong" ] \
+  || { echo "FAIL: cross-isolate RPC failed" >&2; exit 1; }
+[ "$(curl -fsS "http://127.0.0.1:$port/stream")" = "stream-data" ] \
+  || { echo "FAIL: cross-isolate stream failed" >&2; exit 1; }
+wait_log "$DIR/secrets-ok.log" 'span_begin' \
+  || { cat "$DIR/secrets-ok.log" >&2; echo "FAIL: no span_begin log" >&2; exit 1; }
+grep -q "$RID" "$DIR/secrets-ok.log" \
+  || { echo "FAIL: span log has no request id" >&2; exit 1; }
+grep -q '\[redacted\]' "$DIR/secrets-ok.log" \
+  || { echo "FAIL: span attribute secret was not redacted" >&2; exit 1; }
+curl -fsS "http://127.0.0.1:$internal/metrics" > "$DIR/metrics" \
+  || { echo "FAIL: /metrics unavailable" >&2; exit 1; }
+for metric in celld_http_requests_total celld_rpc_calls_total \
+  celld_stream_reads_total celld_trace_spans_total; do
+  grep -q "^$metric" "$DIR/metrics" \
+    || { echo "FAIL: metric $metric missing" >&2; cat "$DIR/metrics" >&2; exit 1; }
+done
+echo "   request id echoed; span logged (secret attr redacted); metrics present"
+
 echo "== wrong key refuses the deployment"
 start_node secrets-wrong "$wrong_port" "$((wrong_port + 1000))" CELLD_SECRET_KEY="$WRONG_KEY" >/dev/null
 wait_log "$DIR/secrets-wrong.log" 'encrypted secrets|authentication failed|CELLD_SECRET_KEY' \

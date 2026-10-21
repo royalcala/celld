@@ -108,6 +108,7 @@ impl DeadNodeGc {
         {
             return None;
         }
+        crate::observability::inc("celld_ownership_takeovers_total", &[]);
 
         let renew_ms = (lease_ttl_ms / 3).max(1);
         let mut renewal = crate::asyncrt::interval(Duration::from_millis(renew_ms));

@@ -1470,7 +1470,7 @@ fn rpc_error_name(code: &str) -> &'static str {
 /// and the cell registry), so this is a boundary conversion, not a client-side
 /// string match. Unknown failures default to `owner-gone`: the operation did
 /// not run.
-fn classify_owner_error(message: &str) -> &'static str {
+pub fn classify_owner_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("overload") {
         "overloaded"
@@ -1508,6 +1508,7 @@ fn set_rpc_error_fields(tc: &mut v8::PinScope, exception: v8::Local<v8::Value>, 
 
 /// Throw a typed, synchronous failure (bad token, bad path, disallowed kind).
 fn loader_throw_typed(scope: &mut v8::PinScope, code: &str, message: &str) {
+    crate::observability::inc("celld_errors_total", &[("code", code)]);
     let message = rpc_error(code, message);
     let (_, text) = split_rpc_error(&message).unwrap_or(("", message.as_str()));
     let text = v8::String::new(scope, text).unwrap();
@@ -7045,6 +7046,10 @@ ops! { OP_NAMES, install_op_functions,
         "__cap_retain" => op_cap_retain,
         "__cap_release" => op_cap_release,
         "__cap_check" => op_cap_check,
+        "__trace_begin" => op_trace_begin,
+        "__trace_attr" => op_trace_attr,
+        "__trace_end" => op_trace_end,
+        "__metric_inc" => op_metric_inc,
         "__stub_rpc_call_token" => op_stub_rpc_call_token,
         "__restore_mint" => op_restore_mint,
         "__restore_params" => op_restore_params,
@@ -9515,6 +9520,57 @@ fn op_cap_check(
         return;
     }
     rv.set(v8::Boolean::new(scope, true).into());
+}
+
+/// Starts a bounded host span for the JS `tracing` API.
+fn op_trace_begin(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = args.get(0).to_rust_string_lossy(scope);
+    let attrs = if args.get(1).is_undefined() {
+        None
+    } else {
+        Some(args.get(1).to_rust_string_lossy(scope))
+    };
+    let parent = args.get(2).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let request_id = args.get(3).to_rust_string_lossy(scope);
+    let id = crate::observability::trace_begin(&name, attrs.as_deref(), parent, &request_id);
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// Sets one attribute on a live host span.
+fn op_trace_attr(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let key = args.get(1).to_rust_string_lossy(scope);
+    let value = args.get(2).to_rust_string_lossy(scope);
+    crate::observability::trace_attribute(id, &key, &value);
+}
+
+/// Ends a host span.
+fn op_trace_end(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let status = args.get(1).to_rust_string_lossy(scope);
+    crate::observability::trace_end(id, &status);
+}
+
+/// Increments a JS-emitted metric from the closed allowlist.
+fn op_metric_inc(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = args.get(0).to_rust_string_lossy(scope);
+    crate::observability::js_metric(&name);
 }
 
 /// Enqueues one capability operation through the native Durable Object RPC

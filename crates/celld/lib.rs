@@ -78,6 +78,7 @@ pub mod ltx_replication;
 pub mod machine;
 pub mod memory;
 pub mod node_log;
+pub mod observability;
 pub(crate) mod operator_cell;
 #[doc(hidden)]
 pub mod otlp;

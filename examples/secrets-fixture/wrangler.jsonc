@@ -7,5 +7,9 @@
   "secrets": {
     "API_TOKEN": "text",
     "TLS_KEY": "key"
+  },
+  "migrations": [{ "tag": "v0", "new_sqlite_classes": ["Counter"] }],
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }]
   }
 }
