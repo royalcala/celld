@@ -14,7 +14,9 @@
 //! async in JS, synchronous underneath — the ops are sync Rust, wrapped in
 //! `async` by the JS harness.
 use crate::asyncrt;
-use crate::capability::{CapabilityClaims, CapabilityKey, CapabilityKind, CapabilityRefs};
+use crate::capability::{
+    CapabilityClaims, CapabilityKey, CapabilityKind, CapabilityRefs, FLAG_RESTORE,
+};
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
@@ -6913,6 +6915,9 @@ ops! { OP_NAMES, install_op_functions,
         "__cap_retain" => op_cap_retain,
         "__cap_release" => op_cap_release,
         "__stub_rpc_call_token" => op_stub_rpc_call_token,
+        "__restore_mint" => op_restore_mint,
+        "__restore_params" => op_restore_params,
+        "__restore_forget" => op_restore_forget,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -9041,16 +9046,32 @@ fn op_rpc_signal_wait(
     rv.set(promise);
 }
 
-/// Process-local capability key. A fleet build derives this from the fleet
-/// secret during startup; a single node mints its own so tokens cannot be
-/// forged by JavaScript in this process.
+/// The process's capability key. A fleet build derives it from the persisted
+/// peer secret during startup; a bucketless single node mints its own so
+/// tokens cannot be forged by JavaScript in this process.
+static CAPABILITY_KEY: OnceLock<CapabilityKey> = OnceLock::new();
+
 fn capability_key() -> &'static CapabilityKey {
-    static KEY: OnceLock<CapabilityKey> = OnceLock::new();
-    KEY.get_or_init(|| {
+    CAPABILITY_KEY.get_or_init(|| {
         let mut bytes = [0_u8; 32];
         getrandom::fill(&mut bytes).expect("OS random source unavailable");
         CapabilityKey::new(bytes)
     })
+}
+
+/// Derive the capability key from the fleet's persistent peer secret.
+///
+/// A capability token is the identity of a handle, and a persistent stub's
+/// token is stored by application code, so the key must survive a restart and
+/// be shared by every node. Deriving it from the secret the fleet already
+/// persists gives both, while staying domain-separated from request signing.
+/// Without a fleet secret (a bucketless single node) tokens stay process-local.
+pub fn init_capability_key(secret: &[u8]) -> anyhow::Result<()> {
+    let key = CapabilityKey::derive(secret)?;
+    // Startup calls this before any isolate runs, so the random fallback
+    // cannot have won.
+    let _ = CAPABILITY_KEY.set(key);
+    Ok(())
 }
 
 /// Process-local exported reference counts, keyed by owner and handle.
@@ -9159,7 +9180,14 @@ fn enqueue_stub_rpc(
     path: &str,
     args_bytes: bytes::Bytes,
 ) -> u64 {
-    let method = format!("__celldStubOp:{}:{}", claims.handle, path);
+    // A persistent handle has no live entry in the owner's table: its
+    // operations replay `[restore]` from the durable row instead.
+    let prefix = if claims.flags & FLAG_RESTORE != 0 {
+        "__celldRestoreOp:"
+    } else {
+        "__celldStubOp:"
+    };
+    let method = format!("{prefix}{}:{}", claims.handle, path);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     let request = RpcCallReq {
@@ -9330,6 +9358,90 @@ fn op_stub_rpc_call_token(
             scope,
             "this capability kind cannot cross isolate boundaries yet",
         ),
+    }
+}
+
+/// The cell whose event is running, if any. Persistent stubs are owned by the
+/// cell that minted them, and only that cell may read their row.
+fn restore_owner(scope: &mut v8::PinScope) -> Option<String> {
+    let context = event_context(scope);
+    current_cell_event(&context).map(|frame| frame.storage)
+}
+
+/// `__restore_mint(paramsSc)` -> token for a persistent stub.
+///
+/// The params are stored in the cell's reserved restore table under a new
+/// handle; the token authenticates the owner and that handle. `[restore]` runs
+/// in the owner (lazily, once per isolate residency) to turn the params back
+/// into a live target.
+fn op_restore_mint(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(params) = view_bytes(args.get(0)) else {
+        return loader_throw(scope, "ctx.restore params are not typed-array bytes");
+    };
+    let Some(owner) = restore_owner(scope) else {
+        return loader_throw(
+            scope,
+            "ctx.restore is durable only inside a Durable Object event",
+        );
+    };
+    let handle = match storage::restore_mint(&owner, &params) {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &error.to_string()),
+    };
+    let claims = CapabilityClaims {
+        kind: CapabilityKind::Cell,
+        owner: owner.clone(),
+        node: String::new(),
+        generation: 0,
+        handle,
+        flags: FLAG_RESTORE,
+    };
+    match capability_key().mint(&claims) {
+        Ok(token) => {
+            capability_refs()
+                .lock()
+                .unwrap()
+                .retain(&claims.owner, claims.handle);
+            rv.set(v8::String::new(scope, &token).unwrap().into());
+        }
+        Err(error) => loader_throw(scope, &error.to_string()),
+    }
+}
+
+/// `__restore_params(handle)` -> Uint8Array | null; the owner's replay input.
+fn op_restore_params(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let handle = args.get(0).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let Some(owner) = restore_owner(scope) else {
+        return loader_throw(scope, "persistent stubs are available only in a cell event");
+    };
+    let result = storage::restore_params(&owner, handle);
+    match result {
+        Ok(Some(params)) => rv.set(bytes_value(scope, params)),
+        Ok(None) => rv.set(v8::null(scope).into()),
+        Err(error) => loader_throw(scope, &error.to_string()),
+    }
+}
+
+/// `__restore_forget(handle)`: drop a persistent stub's durable row.
+fn op_restore_forget(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let handle = args.get(0).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let Some(owner) = restore_owner(scope) else {
+        return;
+    };
+    if let Err(error) = storage::restore_forget(&owner, handle) {
+        loader_throw(scope, &error.to_string());
     }
 }
 

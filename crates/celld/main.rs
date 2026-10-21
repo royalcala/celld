@@ -4135,6 +4135,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
+    // Capability tokens are the identity of a handle. Deriving their key from
+    // the persistent peer secret lets a stored persistent-stub token survive a
+    // restart and verify on any node in the fleet, while staying distinct from
+    // request signing.
+    celld::js::init_capability_key(&peer_key).context("derive the capability key")?;
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
     // Connect-only timeout: a peer request may legitimately run through a
     // restore, but a handshake that never completes provably ran nothing.

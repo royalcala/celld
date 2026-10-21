@@ -428,6 +428,17 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
           PRIMARY KEY(scope,path)) WITHOUT ROWID",
         [],
     )?;
+    // Persistent RPC stubs minted by `ctx.restore(params)`. The row is the
+    // durable half of the handle: the capability token carries the owner and
+    // handle, and this table carries the params `[restore]` replays after the
+    // cell is re-adopted. A user-visible `deleteAll()` drops it with the rest
+    // of the cell's tables.
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS _cf_RESTORE \
+         (scope TEXT NOT NULL, handle INTEGER NOT NULL, params BLOB NOT NULL, \
+          PRIMARY KEY(scope,handle)) WITHOUT ROWID",
+        [],
+    )?;
     let alarm_columns = {
         let mut statement = c.prepare("PRAGMA table_info(_cf_ALARM)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -3536,6 +3547,50 @@ pub fn put_serialized(scope: &str, key: &str, value: &[u8]) -> anyhow::Result<()
     })
 }
 
+/// Store one persistent stub's params and return its durable handle.
+///
+/// Cell events are serialized by the input gate, so the read of the current
+/// maximum and the insert cannot interleave with another event of the same
+/// cell.
+pub fn restore_mint(scope: &str, params: &[u8]) -> anyhow::Result<u64> {
+    with_application_storage_write(scope, |c| {
+        let handle: i64 = c.query_row(
+            "SELECT COALESCE(MAX(handle), 0) + 1 FROM _cf_RESTORE WHERE scope=?1",
+            [scope],
+            |row| row.get(0),
+        )?;
+        c.execute(
+            "INSERT INTO _cf_RESTORE(scope, handle, params) VALUES(?1, ?2, ?3)",
+            rusqlite::params![scope, handle, params],
+        )?;
+        u64::try_from(handle).map_err(Into::into)
+    })
+}
+
+/// Read the params of a persistent stub, or `None` when the handle is gone.
+pub fn restore_params(scope: &str, handle: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    let handle = i64::try_from(handle).context("restore handle is out of range")?;
+    with(scope, |c| {
+        c.prepare_cached("SELECT params FROM _cf_RESTORE WHERE scope=?1 AND handle=?2")?
+            .query_row(rusqlite::params![scope, handle], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
+    })
+    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
+}
+
+/// Drop a persistent stub's durable row. Releasing an already-gone handle is
+/// inert, so a duplicate dispose cannot fail a context teardown.
+pub fn restore_forget(scope: &str, handle: u64) -> anyhow::Result<()> {
+    let handle = i64::try_from(handle).context("restore handle is out of range")?;
+    with_application_storage_write(scope, |c| {
+        c.prepare_cached("DELETE FROM _cf_RESTORE WHERE scope=?1 AND handle=?2")?
+            .execute(rusqlite::params![scope, handle])
+            .map(|_| ())
+            .map_err(Into::into)
+    })
+}
+
 /// Atomically apply a multi-key put.
 #[cfg(celld_internal_tests)]
 pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()> {
@@ -4464,6 +4519,25 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
         }
     });
     publish_alarm(scope);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_creates_the_restore_table() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        schema(&c).expect("schema");
+        let name: String = c
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='_cf_RESTORE'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("restore table");
+        assert_eq!(name, "_cf_RESTORE");
+    }
 }
 
 #[cfg(celld_internal_tests)]

@@ -25,6 +25,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Bumped only when the token layout changes.
 const TOKEN_VERSION: u8 = 1;
+/// Bit 0 is the caller-visible "callable target" marker set by `__cap_mint`.
+pub const FLAG_CALLABLE: u8 = 0b01;
+/// Bit 1 names a handle that is a row of the owner's persistent-stub table, so
+/// an operation on it replays `[restore]` instead of looking up a live target.
+pub const FLAG_RESTORE: u8 = 0b10;
 /// Domain separation for the capability key derived from a fleet secret.
 const KEY_DOMAIN: &[u8] = b"celld-capability-key-v1";
 /// Domain separation for the token MAC.
@@ -588,7 +593,7 @@ mod tests {
         bridge.handle = 11;
         // Reserved flags ride in the signed payload, so a bridge can label a
         // handle without letting a receiver relabel it.
-        bridge.flags = 1;
+        bridge.flags = FLAG_CALLABLE;
         let token = key.mint(&bridge).expect("mint");
         assert_eq!(key.verify(&token).expect("verify"), bridge);
 
@@ -600,6 +605,21 @@ mod tests {
             0,
             "flags follow the signed payload"
         );
+    }
+
+    #[test]
+    fn restore_flag_is_disjoint_from_the_callable_marker() {
+        // `__cap_mint` sets bit 0 for a callable target; a persistent-stub
+        // handle must not be mistaken for one (that collision dispatched
+        // ordinary method stubs into the `[restore]` replay path).
+        assert_eq!(FLAG_CALLABLE & FLAG_RESTORE, 0);
+        let mut restored = claims();
+        restored.handle = 12;
+        restored.flags = FLAG_RESTORE;
+        let token = key().mint(&restored).expect("mint");
+        let verified = key().verify(&token).expect("verify");
+        assert_eq!(verified.flags & FLAG_RESTORE, FLAG_RESTORE);
+        assert_eq!(verified.flags & FLAG_CALLABLE, 0);
     }
 
     #[test]

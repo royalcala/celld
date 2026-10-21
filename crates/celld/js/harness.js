@@ -2134,6 +2134,10 @@ const __makeLoopbackDurableObjectClass = (name) => {
   });
   return specialize;
 };
+// Facet stubs are pipeline proxies, not RpcTargets: every string property is
+// a remote method. A persistent stub returned by `[restore]` may be one, so
+// the resolver recognises them instead of applying own-property visibility.
+const __facetStubs = new WeakSet();
 class DurableObjectFacets {
   constructor(state) {
     this._state = state;
@@ -2236,6 +2240,7 @@ class DurableObjectFacets {
         return __makeNode(session, [prop], null);
       },
     });
+    __facetStubs.add(record.stub);
     this._running.set(name, record);
     return record.stub;
   }
@@ -2869,6 +2874,20 @@ class DurableObjectState {
   waitUntil(promise) {
     __registerWaitUntil(promise);
   }
+  // A persistent stub: the params are stored in this cell's reserved table
+  // and the returned capability replays `[restore](params)` in the owner on
+  // first use. It survives eviction because the row is part of the cell.
+  restore(params) {
+    let paramsSc;
+    try {
+      paramsSc = __rpcOut(params, false);
+    } catch (error) {
+      throw new TypeError(
+        "ctx.restore params must be structured-cloneable without live stubs.",
+        { cause: error });
+    }
+    return __foreignStub(__restore_mint(paramsSc));
+  }
 }
 function _instance(scope) {
   let inst = __cell.instances[scope];
@@ -2878,6 +2897,7 @@ function _instance(scope) {
     if (!cls) throw new Error("no DO class " + className);
     const state = new DurableObjectState(scope);
     inst = new cls(state, __cell.env);
+    state[__ctxInstance] = inst;
     Object.defineProperty(inst, "__celldState", { value: state });
     // Workerd worker-rpc.c++ getTargetInfo(): RPC needs `extends
     // DurableObject` unless the js_rpc compat flag is on. Decided
@@ -3811,6 +3831,9 @@ const __ctxNow = () => {
   const frame = __als_get();
   return frame === undefined ? undefined : frame.get(__ctxKey);
 };
+// The instance a context belongs to, for `ctx.restore()` in an entrypoint or
+// Durable Object. Set when the instance is constructed.
+const __ctxInstance = Symbol("celld.ctxInstance");
 // Run `fn` under context `id` (undefined = a fresh one). An async
 // fn started inside keeps the frame across its awaits. The prior
 // frame is cloned so user AsyncLocalStorage stores still flow into
@@ -3980,6 +4003,12 @@ const __cellRelease = (scope) => {
   // stop that waits for nobody can, so the release drops every block record
   // together with the other state for this residency.
   __cellBlocks.delete(scope);
+  // A restored target belongs to the residency too: the durable row stays,
+  // but the live object it produced must not outlive the instance that made
+  // it. The next operation replays `[restore]`.
+  for (const [handle, entry] of __restoreEntries) {
+    if (entry.scope === scope) __restoreEntries.delete(handle);
+  }
   // An entry holds `target`, which can be an object the released
   // instance owns. Dropping it ends that reachability; `released` is
   // what an already-revived handle reads, since it holds its entry
@@ -4032,8 +4061,19 @@ const __rpcNoSuchMethod = (prop) => new TypeError(
 const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
+  if (__facetStubs.has(target)) {
+    if (typeof prop !== "string") return undefined;
+    return target[prop];
+  }
   if (target instanceof __cf.RpcTarget) {
-    if (Object.hasOwn(target, prop) || !(prop in target) ||
+    // A Proxy that reports the RpcTarget prototype is a wildcard receiver:
+    // its [[Get]] answers every method name (the shape cloudflare-os uses
+    // to carry a facet stub). Own-property visibility would reject each
+    // method, so only the prototype's names stay off limits.
+    if (__util_proxy_details(target) !== undefined) {
+      if (prop === "then" || prop in Object.prototype)
+        throw __rpcNoSuchMethod(prop);
+    } else if (Object.hasOwn(target, prop) || !(prop in target) ||
         prop in Object.prototype) throw __rpcNoSuchMethod(prop);
   } else if (!Object.hasOwn(target, prop)) {
     throw __rpcNoSuchMethod(prop);
@@ -5547,6 +5587,75 @@ const __dispatchStubOp = async (handle, path, argsBytes) => {
       for (const received of decoded.received) __disposeStub(received);
   }
 };
+// ---- persistent stubs (`ctx.restore`) ----------------------------
+// The durable row holds the params; the live target is `[restore](params)`,
+// rebuilt lazily on first use in an isolate and cached for its residency.
+// `__restorePending` collapses concurrent first uses onto one replay.
+const __restoreEntries = new Map();
+const __restorePending = new Map();
+const __restoreEntry = async (handle) => {
+  const cached = __restoreEntries.get(handle);
+  if (cached !== undefined) return cached;
+  let pending = __restorePending.get(handle);
+  if (pending === undefined) {
+    pending = (async () => {
+      const paramsSc = __restore_params(handle);
+      if (paramsSc === null) return undefined;
+      const scope = __currentActorScope();
+      if (scope === "") return undefined;
+      const inst = await _readyInstance(scope);
+      const restoreFn = inst[__cf.restore];
+      if (typeof restoreFn !== "function")
+        throw new TypeError(
+          "This Durable Object does not implement [restore].");
+      const target = await restoreFn.call(inst, __rpcDes(paramsSc));
+      const entry = {
+        id: handle, target, refs: 1, ctx: __ctxNow(), scope,
+      };
+      __restoreEntries.set(handle, entry);
+      return entry;
+    })();
+    __restorePending.set(handle, pending);
+    pending.then(
+      () => {
+        if (__restorePending.get(handle) === pending)
+          __restorePending.delete(handle);
+      },
+      () => {
+        if (__restorePending.get(handle) === pending)
+          __restorePending.delete(handle);
+      });
+  }
+  return await pending;
+};
+// One operation on a persistent handle. `path === null` is disposal: drop the
+// cached target and the durable row, and run the target's own disposer.
+const __dispatchRestoreOp = async (handle, path, argsBytes) => {
+  if (path === null) {
+    const entry = __restoreEntries.get(handle);
+    __restoreEntries.delete(handle);
+    try { __restore_forget(handle); } catch {}
+    if (entry !== undefined) {
+      const disposer = entry.target?.[Symbol.dispose];
+      if (typeof disposer === "function")
+        Promise.resolve().then(() => disposer.call(entry.target));
+    }
+    return __rpcOut(null, true);
+  }
+  const entry = await __restoreEntry(handle);
+  if (entry === undefined)
+    throw new Error(
+      "This persistent stub's handle is no longer available.");
+  const decoded = argsBytes === null ? null : __rpcDesArgs(argsBytes);
+  try {
+    return await __ctxRun(entry.ctx, async () => __rpcRun(
+      () => __rpcWalk(entry.target, path,
+        decoded === null ? null : decoded.args, false), true));
+  } finally {
+    if (decoded !== null)
+      for (const received of decoded.received) __disposeStub(received);
+  }
+};
 // The stateless-owner entrypoint: a WorkerJob::StubRpc event in the isolate
 // that exported the target calls this with the path still as JSON.
 __celld.__dispatchStubRpc = async (id, pathJson, args) =>
@@ -5566,6 +5675,14 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       const pathJson = rest.slice(separator + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
       return await __dispatchStubOp(handle, path, args);
+    }
+    if (method.startsWith("__celldRestoreOp:")) {
+      const rest = method.slice("__celldRestoreOp:".length);
+      const separator = rest.indexOf(":");
+      const handle = Number(rest.slice(0, separator));
+      const pathJson = rest.slice(separator + 1);
+      const path = pathJson === "null" ? null : JSON.parse(pathJson);
+      return await __dispatchRestoreOp(handle, path, args);
     }
     // A string is the legacy JSON flavor; bytes are V8 structured clone.
     // Answer in kind.
@@ -5623,7 +5740,9 @@ const __entrypointClass = (name) => {
 const __constructEntrypoint = (cls, props) => {
   const ctx = __beginEvent(props);
   try {
-    return new cls(ctx, __cell.env);
+    const inst = new cls(ctx, __cell.env);
+    ctx[__ctxInstance] = inst;
+    return inst;
   } finally {
     const drain = __endEvent();
     if (drain !== null) __wait_until(drain);
@@ -9709,6 +9828,10 @@ const __cf = __celld.__cf = {
   RpcPromise: class RpcPromise extends Promise {},
   RpcProperty: class RpcProperty {},
   ServiceStub: class ServiceStub {},
+  // `import { restore } from "cloudflare:workers"`: the well-known symbol a
+  // Durable Object implements to rebuild a persistent stub's target from the
+  // params stored by `ctx.restore(params)`.
+  restore: Symbol.for("cloudflare:restore"),
   // `import { waitUntil } from "cloudflare:workers"`: register into
   // the current event or extend its active background work. Outside either
   // lifetime this is Workerd's global-scope error.
@@ -11149,6 +11272,24 @@ const __entrypointContext = (props = __defaultProps) => ({
   abort: __ctxAbortCurrent,
   props,
   get exports() { return __ctxExports(); },
+  // An entrypoint owns no durable storage, so its persistent stub lives for
+  // this isolate only: `[restore]` runs now and the result is a loopback
+  // stub. Durable restore is a Durable Object feature.
+  restore(params) {
+    const inst = this[__ctxInstance];
+    const restoreFn = inst?.[__cf.restore];
+    if (typeof restoreFn !== "function")
+      throw new TypeError(
+        "This entrypoint does not implement [restore].");
+    const target = restoreFn.call(inst, params);
+    if (target !== null && typeof target === "object" &&
+        typeof target.then === "function")
+      throw new TypeError(
+        "A stateless [restore] must return its target synchronously.");
+    if (__stubMeta.has(target) || __remoteStubMeta.has(target)) return target;
+    return __makeStub(
+      __newEntry(target), typeof target === "function");
+  },
 });
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
