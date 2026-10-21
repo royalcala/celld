@@ -7038,6 +7038,7 @@ ops! { OP_NAMES, install_op_functions,
         "__cap_mint" => op_cap_mint,
         "__cap_retain" => op_cap_retain,
         "__cap_release" => op_cap_release,
+        "__cap_check" => op_cap_check,
         "__stub_rpc_call_token" => op_stub_rpc_call_token,
         "__restore_mint" => op_restore_mint,
         "__restore_params" => op_restore_params,
@@ -9411,11 +9412,19 @@ fn op_cap_mint(
             return;
         }
     };
+    let heap = crate::pool::current_slot()
+        .map(|slot| slot.heap_id().to_string())
+        .unwrap_or_default();
     let claims = CapabilityClaims {
         kind,
-        owner,
-        node: String::new(),
-        generation: 0,
+        owner: owner.clone(),
+        route: if kind == CapabilityKind::Cell {
+            facet_root(&owner).unwrap_or_default()
+        } else {
+            String::new()
+        },
+        node: crate::capability::own_node().to_string(),
+        generation: crate::capability::generation_for(&heap),
         handle,
         flags,
     };
@@ -9432,11 +9441,73 @@ fn op_cap_mint(
     }
 }
 
+/// `__cap_check(token)`: the owner validates a capability before using its
+/// handle. Durable restore rows re-resolve by scope; every transient handle is
+/// pinned to the node and isolate incarnation that minted it, so a token from
+/// a previous owner or isolate fails instead of aliasing a new entry.
+fn op_cap_check(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    let claims = match capability_key().verify(&token) {
+        Ok(claims) => claims,
+        Err(error) => {
+            loader_throw_typed(scope, "forbidden", &error.to_string());
+            return;
+        }
+    };
+    let context = event_context(scope);
+    let Some(frame) = current_cell_event(&context) else {
+        loader_throw_typed(scope, "forbidden", "capability used outside a cell event");
+        return;
+    };
+    if claims.flags & FLAG_RESTORE != 0 {
+        if claims.owner != frame.storage {
+            loader_throw_typed(
+                scope,
+                "stale-generation",
+                "restore handle belongs to another cell",
+            );
+            return;
+        }
+        rv.set(v8::Boolean::new(scope, true).into());
+        return;
+    }
+    let own = crate::capability::own_node();
+    if !claims.node.is_empty() && !own.is_empty() && claims.node != own {
+        loader_throw_typed(scope, "owner-moved", "capability belongs to another node");
+        return;
+    }
+    let heap = crate::pool::current_slot()
+        .map(|slot| slot.heap_id().to_string())
+        .unwrap_or_default();
+    if claims.generation != crate::capability::generation_for(&heap) {
+        loader_throw_typed(
+            scope,
+            "stale-generation",
+            "capability belongs to a retired isolate incarnation",
+        );
+        return;
+    }
+    if claims.owner != frame.storage {
+        loader_throw_typed(
+            scope,
+            "stale-generation",
+            "capability belongs to another cell",
+        );
+        return;
+    }
+    rv.set(v8::Boolean::new(scope, true).into());
+}
+
 /// Enqueues one capability operation through the native Durable Object RPC
 /// path. The cell's `__dispatchRpc` recognises the `__celldStubOp:` prefix.
 fn enqueue_stub_rpc(
     scope: &mut v8::PinScope,
     claims: &CapabilityClaims,
+    token: &str,
     path: &str,
     args_bytes: bytes::Bytes,
 ) -> u64 {
@@ -9451,12 +9522,17 @@ fn enqueue_stub_rpc(
     } else {
         "__celldStubOp:"
     };
-    let method = format!("{prefix}{}:{}", claims.handle, path);
+    let method = format!("{prefix}{}:{}:{}", claims.handle, token, path);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: claims.owner.clone(),
+        route: if claims.route.is_empty() {
+            None
+        } else {
+            Some(claims.route.clone())
+        },
         name: None,
         method,
         args: RpcData::V8(args_bytes),
@@ -9591,7 +9667,7 @@ fn op_cap_release(
             CapabilityKind::Cell => {
                 // Fire-and-forget: the owner entry's dispose does not need a
                 // reply.
-                let _ = enqueue_stub_rpc(scope, &claims, "null", bytes::Bytes::new());
+                let _ = enqueue_stub_rpc(scope, &claims, &token, "null", bytes::Bytes::new());
             }
             CapabilityKind::Stateless => {
                 let _ = enqueue_stub_rpc_stateless(scope, &claims, None, None);
@@ -9636,12 +9712,22 @@ fn op_stub_rpc_call_token(
             let id = enqueue_stub_rpc(
                 scope,
                 &claims,
+                &token,
                 &path,
                 bytes::Bytes::copy_from_slice(args_bytes.as_deref().unwrap_or_default()),
             );
             rv.set(promise_for(scope, id));
         }
         CapabilityKind::Stateless => {
+            let own = crate::capability::own_node();
+            if !claims.node.is_empty() && !own.is_empty() && claims.node != own {
+                loader_throw_typed(
+                    scope,
+                    "owner-moved",
+                    "stateless capability is node-local and belongs to another node",
+                );
+                return;
+            }
             let Ok(path) = serde_json::from_str::<Option<Vec<String>>>(&path) else {
                 loader_throw_typed(scope, "forbidden", "capability path is not valid JSON");
                 return;
@@ -9692,6 +9778,7 @@ fn op_restore_mint(
     let claims = CapabilityClaims {
         kind: CapabilityKind::Cell,
         owner: owner.clone(),
+        route: String::new(),
         node: String::new(),
         generation: 0,
         handle,
@@ -9820,6 +9907,7 @@ fn op_facet_restore_mint(
     let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: root,
+        route: None,
         name: None,
         method: "__celldMintFacetRestore".to_owned(),
         args: RpcData::V8(args_sc.into()),
@@ -9874,6 +9962,7 @@ fn op_rpc_call(
     let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: cell,
+        route: None,
         name,
         method,
         args,

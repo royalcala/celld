@@ -202,6 +202,9 @@ pub fn set_asset_call_tx(tx: tokio::sync::mpsc::UnboundedSender<AssetCallReq>) {
 /// Routing/activation is identical to fetch calls.
 pub struct RpcCallReq {
     pub scope: String,
+    /// Routing scope when it differs from `scope` (a facet whose root owns
+    /// the lease). Empty means route by `scope`.
+    pub route: Option<String>,
     pub name: Option<String>,
     pub method: String,
     pub args: RpcData,

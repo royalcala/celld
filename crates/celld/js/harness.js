@@ -5907,7 +5907,8 @@ const __rpcTargetMethod = async (scope, method) => {
 // Run one capability operation in the isolate that owns the target. The
 // caller only sent a verified token; the host turned it into a native DO RPC
 // call with the method below. `path === null` is disposal.
-const __dispatchStubOp = async (handle, path, argsBytes) => {
+const __dispatchStubOp = async (handle, token, path, argsBytes) => {
+  if (token) __cap_check(token);
   const entry = __stubEntries.get(handle);
   if (entry === undefined || entry.released)
     throw __rpcDisposedError();
@@ -5968,7 +5969,8 @@ const __restoreEntry = async (handle) => {
 };
 // One operation on a persistent handle. `path === null` is disposal: drop the
 // cached target and the durable row, and run the target's own disposer.
-const __dispatchRestoreOp = async (handle, path, argsBytes) => {
+const __dispatchRestoreOp = async (handle, token, path, argsBytes) => {
+  __cap_check(token);
   if (path === null) {
     const entry = __restoreEntries.get(handle);
     __restoreEntries.delete(handle);
@@ -6056,7 +6058,8 @@ const __dispatchFacetRestore = async (args) => {
 // The root half: replay the parent handle to reach the facet, then forward
 // one operation through the raw facet transport. The parent is re-minted by
 // its own `[restore]`, so no loader id or class is persisted.
-const __dispatchFacetRestoreOp = async (handle, path, argsBytes) => {
+const __dispatchFacetRestoreOp = async (handle, token, path, argsBytes) => {
+  __cap_check(token);
   const chainBytes = __restore_params(handle);
   if (chainBytes === null) throw __rpcDisposedError();
   const { parent, params } = __rpcDes(chainBytes);
@@ -6091,7 +6094,7 @@ const __dispatchFacetRestoreOp = async (handle, path, argsBytes) => {
 // a rejection into a plain string and the caller would lose `name`/`code`.
 __celld.__dispatchStubRpc = async (id, pathJson, args) => {
   try {
-    return await __dispatchStubOp(id, JSON.parse(pathJson), args);
+    return await __dispatchStubOp(id, "", JSON.parse(pathJson), args);
   } catch (error) {
     return __rpcErrOut(error);
   }
@@ -6121,24 +6124,30 @@ __celld.__dispatchRpc = async (scope, method, args) => {
   try {
     if (method.startsWith("__celldStubOp:")) {
       const rest = method.slice("__celldStubOp:".length);
-      const separator = rest.indexOf(":");
-      const handle = Number(rest.slice(0, separator));
-      const pathJson = rest.slice(separator + 1);
+      const first = rest.indexOf(":");
+      const afterHandle = rest.slice(first + 1);
+      const second = afterHandle.indexOf(":");
+      const handle = Number(rest.slice(0, first));
+      const token = afterHandle.slice(0, second);
+      const pathJson = afterHandle.slice(second + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
       try {
-        return await __dispatchStubOp(handle, path, args);
+        return await __dispatchStubOp(handle, token, path, args);
       } catch (error) {
         return __rpcErrOut(error);
       }
     }
     if (method.startsWith("__celldRestoreOp:")) {
       const rest = method.slice("__celldRestoreOp:".length);
-      const separator = rest.indexOf(":");
-      const handle = Number(rest.slice(0, separator));
-      const pathJson = rest.slice(separator + 1);
+      const first = rest.indexOf(":");
+      const afterHandle = rest.slice(first + 1);
+      const second = afterHandle.indexOf(":");
+      const handle = Number(rest.slice(0, first));
+      const token = afterHandle.slice(0, second);
+      const pathJson = afterHandle.slice(second + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
       try {
-        return await __dispatchRestoreOp(handle, path, args);
+        return await __dispatchRestoreOp(handle, token, path, args);
       } catch (error) {
         return __rpcErrOut(error);
       }
@@ -6170,12 +6179,15 @@ __celld.__dispatchRpc = async (scope, method, args) => {
     }
     if (method.startsWith("__celldFacetRestoreOp:")) {
       const rest = method.slice("__celldFacetRestoreOp:".length);
-      const separator = rest.indexOf(":");
-      const handle = Number(rest.slice(0, separator));
-      const pathJson = rest.slice(separator + 1);
+      const first = rest.indexOf(":");
+      const afterHandle = rest.slice(first + 1);
+      const second = afterHandle.indexOf(":");
+      const handle = Number(rest.slice(0, first));
+      const token = afterHandle.slice(0, second);
+      const pathJson = afterHandle.slice(second + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
       try {
-        return await __dispatchFacetRestoreOp(handle, path, args);
+        return await __dispatchFacetRestoreOp(handle, token, path, args);
       } catch (error) {
         return __rpcErrOut(error);
       }

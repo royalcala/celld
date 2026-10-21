@@ -1408,17 +1408,22 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
 async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
     let RpcCallReq {
         scope,
+        route,
         name,
         method,
         args,
         request_id,
-        reply,
+        mut reply,
     } = call;
     let result = async {
         anyhow::ensure!(
             celld_logic::cell::valid_cell_scope(&scope),
             "cell scope is malformed or exceeds the fleet storage limit"
         );
+        // A facet token routes by its root's lease but dispatches to the
+        // facet scope, so another node can forward it to the owner.
+        let route_scope = route.unwrap_or_else(|| scope.clone());
+        let dispatch_scope = scope.clone();
         // A capability owned by an embedded facet has no published cell to
         // route to. Its root owns the lease and its slot runs the facet, so
         // dispatch locally under the root's request gate.
@@ -1444,21 +1449,29 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
         let mut dispatcher = RemoteRouteRetry::new(app.operation_deadline_ms);
         loop {
             let Routed { request, route } = app
-                .request(scope.clone())
+                .request(route_scope.clone())
                 .await
-                .map_err(|error| anyhow::anyhow!("route RPC {scope}: {error:?}"))?;
+                .map_err(|error| anyhow::anyhow!("route RPC {route_scope}: {error:?}"))?;
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
+                    if route_scope != dispatch_scope {
+                        // The root is ours but the facet is not registered:
+                        // it was evicted after the token was minted.
+                        anyhow::bail!(
+                            "stale-generation: facet {} is not hosted on this node",
+                            dispatch_scope
+                        );
+                    }
                     // Use the caller's id so its abort, published when the
                     // caller's host op is dropped, reaches this cell event.
                     let local_request_id = local_dispatch_request_id(request_id);
                     let completed = app
-                        .local_request(request, scope.clone(), local_request_id, "local")
+                        .local_request(request, dispatch_scope.clone(), local_request_id, "local")
                         .run(async {
                             app.runtime
                                 .as_ref()
                                 .context("no cell runtime")?
-                                .rpc(scope, name, method, args, local_request_id)
+                                .rpc(dispatch_scope, name, method, args, local_request_id)
                                 .await
                         })
                         .await;
@@ -1474,7 +1487,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
             if dispatcher.observe(&node, epoch) {
                 match dispatcher.wait(None).await {
                     RemoteRetryOutcome::Ready => {
-                        dispatcher.invalidate(&app, &scope).await;
+                        dispatcher.invalidate(&app, &route_scope).await;
                         continue;
                     }
                     RemoteRetryOutcome::Stop => {
@@ -1489,19 +1502,38 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
             );
             let expects_structured_response = matches!(args, celld::js::RpcData::V8(_));
             {
-                let response = peer_tunnel::rpc(
-                    &peer_tunnel::Peer {
-                        http: &app.peer_http,
-                        auth: &app.peer_auth,
-                        addr: &addr,
-                        node: &node,
-                    },
-                    &scope,
-                    name.as_deref(),
-                    &method,
-                    &args,
-                )
-                .await;
+                let peer = peer_tunnel::Peer {
+                    http: &app.peer_http,
+                    auth: &app.peer_auth,
+                    addr: &addr,
+                    node: &node,
+                };
+                let forwarded =
+                    peer_tunnel::rpc(&peer, &scope, name.as_deref(), &method, &args, request_id);
+                let response = match request_id {
+                    Some(cancel_id) => {
+                        let mut closed = Box::pin(reply.closed());
+                        let mut forwarded = Box::pin(forwarded);
+                        match futures_util::future::select(closed.as_mut(), forwarded.as_mut())
+                            .await
+                        {
+                            futures_util::future::Either::Left(((), _)) => {
+                                let _ = send_peer_abort(
+                                    app.peer_http.clone(),
+                                    app.peer_auth.clone(),
+                                    node.clone(),
+                                    addr.clone(),
+                                    scope.clone(),
+                                    cancel_id,
+                                )
+                                .await;
+                                return Ok(celld::js::RpcData::Json("null".into()));
+                            }
+                            futures_util::future::Either::Right((response, _)) => response,
+                        }
+                    }
+                    None => forwarded.await,
+                };
                 // Classify failures before response decoding. An explicit stale
                 // owner ran nothing; a failed or truncated reply after execution
                 // remains ambiguous and cannot justify another RPC invocation.
@@ -2266,6 +2298,9 @@ async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String
             if phase.is_none() || phase == Some("handler") {
                 runtime.abort_fetch(&scope, request_id);
             }
+            // A forwarded cell RPC samples its abort between turns; mark the
+            // id so the owner's drive loop can cancel the running method.
+            celld::js::abort_request(request_id);
             response(StatusCode::NO_CONTENT, Bytes::new())
         }
         None => response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"),
@@ -2279,19 +2314,24 @@ pub(crate) async fn dispatch_forwarded_rpc(
     name: Option<String>,
     rpc_method: String,
     args: celld::js::RpcData,
+    request_id: Option<celld::js::RequestId>,
 ) -> HttpReply {
-    let result = match app.request(scope.clone()).await {
+    // A forwarded facet op names the facet; its root owns the lease. This node
+    // hosts both, so route the root and dispatch the facet scope.
+    let dispatch_scope = scope.clone();
+    let route_scope = celld::js::facet_root(&scope).unwrap_or_else(|| scope.clone());
+    let result = match app.request(route_scope.clone()).await {
         Ok(Routed {
             request,
             route: Route::Local,
         }) => {
-            let local_request_id = local_dispatch_request_id(None);
-            let local = app.local_request(request, scope.clone(), local_request_id, "local");
+            let local_request_id = local_dispatch_request_id(request_id);
+            let local = app.local_request(request, route_scope, local_request_id, "local");
             let Some(runtime) = &app.runtime else {
                 return peer_response(response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"));
             };
             let completed = local
-                .run(runtime.rpc(scope, name, rpc_method, args, local_request_id))
+                .run(runtime.rpc(dispatch_scope, name, rpc_method, args, local_request_id))
                 .await;
             match completed.result {
                 Ok(outcome) => Ok(outcome.data),
@@ -3784,6 +3824,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();
     let node = std::env::var("CELLD_NODE").unwrap_or_else(|_| random_node_session_id());
+    // Capability tokens carry this process's node and incarnation.
+    celld::capability::set_identity(&node);
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;

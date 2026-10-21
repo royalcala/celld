@@ -23,8 +23,38 @@ use std::fmt;
 
 type HmacSha256 = Hmac<Sha256>;
 
+static OWN_NODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static INCARNATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Installs this process's fleet identity before any isolate mints a token.
+/// The incarnation makes a token from a previous process (same node name)
+/// stale even when its isolate heap ids repeat.
+pub fn set_identity(node: &str) {
+    let _ = OWN_NODE.set(node.to_owned());
+    let mut bytes = [0u8; 8];
+    let _ = getrandom::fill(&mut bytes);
+    let _ = INCARNATION.set(u64::from_le_bytes(bytes));
+}
+
+/// The node that minted this process's tokens (empty in tests).
+pub fn own_node() -> &'static str {
+    OWN_NODE.get().map(String::as_str).unwrap_or("")
+}
+
+/// A token generation for one isolate heap. Distinct processes and distinct
+/// isolate incarnations produce distinct values.
+pub fn generation_for(heap: &str) -> u64 {
+    let incarnation = *INCARNATION.get().unwrap_or(&0);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ incarnation;
+    for byte in heap.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// Bumped only when the token layout changes.
-const TOKEN_VERSION: u8 = 1;
+const TOKEN_VERSION: u8 = 2;
 /// Bit 0 is the caller-visible "callable target" marker set by `__cap_mint`.
 pub const FLAG_CALLABLE: u8 = 0b01;
 /// Bit 1 names a handle that is a row of the owner's persistent-stub table, so
@@ -82,6 +112,9 @@ pub struct CapabilityClaims {
     pub kind: CapabilityKind,
     /// Cell scope, facet scope, heap id, or service name, by kind.
     pub owner: String,
+    /// Routing scope when it differs from `owner` (a facet whose root owns
+    /// the lease). Empty means route by `owner`.
+    pub route: String,
     /// Node that owns the target. Empty only for tests.
     pub node: String,
     /// Owner incarnation. A token from an older incarnation is stale.
@@ -103,6 +136,7 @@ impl CapabilityClaims {
         Self {
             kind: CapabilityKind::Cell,
             owner: owner.into(),
+            route: String::new(),
             node: node.into(),
             generation,
             handle,
@@ -249,6 +283,7 @@ impl CapabilityKey {
 
 fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> {
     let owner = claims.owner.as_bytes();
+    let route = claims.route.as_bytes();
     let node = claims.node.as_bytes();
     if owner.len() > MAX_OWNER_LEN {
         return Err(CapabilityError::OwnerTooLong);
@@ -258,8 +293,10 @@ fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> 
     }
     let owner_len = u16::try_from(owner.len()).map_err(|_| CapabilityError::OwnerTooLong)?;
     let node_len = u16::try_from(node.len()).map_err(|_| CapabilityError::NodeTooLong)?;
+    let route_len = u16::try_from(route.len()).map_err(|_| CapabilityError::OwnerTooLong)?;
 
-    let mut payload = Vec::with_capacity(1 + 1 + 1 + 8 + 8 + 2 + owner.len() + 2 + node.len());
+    let mut payload =
+        Vec::with_capacity(1 + 1 + 1 + 8 + 8 + 2 + owner.len() + 2 + node.len() + 2 + route.len());
     payload.push(TOKEN_VERSION);
     payload.push(claims.kind.as_u8());
     payload.push(claims.flags);
@@ -269,6 +306,8 @@ fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> 
     payload.extend_from_slice(owner);
     payload.extend_from_slice(&node_len.to_le_bytes());
     payload.extend_from_slice(node);
+    payload.extend_from_slice(&route_len.to_le_bytes());
+    payload.extend_from_slice(route);
     Ok(payload)
 }
 
@@ -284,12 +323,14 @@ fn parse_claims(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
     let handle = take_u64(payload, &mut cursor)?;
     let owner = take_string(payload, &mut cursor, MAX_OWNER_LEN)?;
     let node = take_string(payload, &mut cursor, MAX_NODE_LEN)?;
+    let route = take_string(payload, &mut cursor, MAX_OWNER_LEN)?;
     if cursor != payload.len() {
         return Err(CapabilityError::Malformed);
     }
     Ok(CapabilityClaims {
         kind,
         owner,
+        route,
         node,
         generation,
         handle,
@@ -478,6 +519,7 @@ mod tests {
         CapabilityClaims {
             kind: CapabilityKind::Cell,
             owner: "OverseerDurableObject:abc".to_owned(),
+            route: String::new(),
             node: "node-a".to_owned(),
             generation: 42,
             handle: 9,
@@ -528,12 +570,18 @@ mod tests {
     }
 
     #[test]
+    fn generation_is_heap_and_incarnation_specific() {
+        assert_eq!(generation_for("heap-a"), generation_for("heap-a"));
+        assert_ne!(generation_for("heap-a"), generation_for("heap-b"));
+    }
+
+    #[test]
     fn unknown_version_and_kind_are_rejected() {
         let key = key();
         let mut payload = encode_claims(&claims()).expect("encode");
-        payload[0] = 2;
+        payload[0] = 99;
         let token = key.sign_payload(&payload).expect("sign");
-        assert_eq!(key.verify(&token), Err(CapabilityError::UnknownVersion(2)));
+        assert_eq!(key.verify(&token), Err(CapabilityError::UnknownVersion(99)));
 
         let mut payload = encode_claims(&claims()).expect("encode");
         payload[1] = 99;

@@ -578,6 +578,11 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     "RPC method header is missing",
                 )));
             };
+            let request_id = inner
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(celld::js::parse_request_id);
             let body =
                 match collect_limited_body(inner.into_body(), MAX_PEER_FORWARD_BODY_BYTES).await {
                     Ok(body) => body,
@@ -598,7 +603,7 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     }
                 }
             };
-            let reply = dispatch_forwarded_rpc(app, scope, name, method, args).await;
+            let reply = dispatch_forwarded_rpc(app, scope, name, method, args, request_id).await;
             Ok(reply)
         }
     });
@@ -614,6 +619,7 @@ pub(crate) async fn rpc(
     name: Option<&str>,
     method: &str,
     args: &celld::js::RpcData,
+    request_id: Option<celld::js::RequestId>,
 ) -> anyhow::Result<Response<PooledResponseBody>> {
     let (content_type, payload) = match args {
         celld::js::RpcData::Json(json) => ("application/json", Bytes::from(json.clone())),
@@ -631,6 +637,9 @@ pub(crate) async fn rpc(
                 .header(hyper::header::CONTENT_TYPE, content_type);
             if let Some(name) = name {
                 inner = inner.header(NAME_HEADER, name);
+            }
+            if let Some(id) = request_id {
+                inner = inner.header(REQUEST_ID_HEADER, celld::js::request_id_string(id));
             }
             Ok(inner.body(body)?)
         },

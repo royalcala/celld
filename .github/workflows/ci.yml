@@ -48,3 +48,48 @@ jobs:
 
       - name: Build celld
         run: cargo build --bin celld
+
+  two-node:
+    name: Two-node fleet (S3)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    # An S3-compatible endpoint backed by the filesystem. MinIO's current
+    # community artifacts are gated; s3s-fs implements the conditional-write
+    # surface the bucket probe requires and drives the same code path as MinIO.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" \
+            --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_VERSION"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-two-node-${{ env.RUST_VERSION }}
+
+      - name: Build celld
+        run: cargo build --bin celld
+
+      - name: Install esbuild and the S3 endpoint
+        run: |
+          set -euo pipefail
+          npm install --global esbuild
+          cargo install s3s-fs --version 0.17.0
+
+      - name: Two-node matrix
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/s3s-data/celld-fleet
+          s3s-fs /tmp/s3s-data --host 127.0.0.1 --port 9000 \
+            --access-key minioadmin --secret-key minioadmin &
+          for _ in $(seq 1 80); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            [ -n "$code" ] && [ "$code" != "000" ] && break
+            sleep 0.25
+          done
+          S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=celld-fleet \
+            CELLD_BIN=target/debug/celld CELLD_ESBUILD="$(command -v esbuild)" \
+            bash scripts/e2e-2node.sh
