@@ -1528,6 +1528,10 @@ class SyncKvStorage {
   put(key, value) {
     this._storage._assertTransactionActive("kv.put");
     key = String(key);
+    if (__hasDurableClass(value)) {
+      __storage_put_serialized(this._storage._scope, key, __storedBytes(value));
+      return;
+    }
     try {
       __storage_put(this._storage._scope, key, value);
     } catch (error) {
@@ -1618,6 +1622,12 @@ class DurableObjectStorage {
   async put(k, val) {
     this._assertTransactionActive("put");
     if (typeof k === "string") {
+      if (__hasDurableClass(val)) {
+        __storage_queue_put_serialized(this._scope, k, __storedBytes(val));
+        await Promise.resolve();
+        this._flushPendingPuts();
+        return;
+      }
       try {
         __storage_queue_put(this._scope, k, val);
       } catch (error) {
@@ -1632,6 +1642,18 @@ class DurableObjectStorage {
     if (source.length === 0) return;
     const entries =
       source.map(([key, value]) => [String(key), value]);
+    if (entries.some(([, value]) => __hasDurableClass(value))) {
+      for (const [key, value] of entries) {
+        try {
+          __storage_queue_put_serialized(this._scope, key, __sc_encode(value));
+        } catch (error) {
+          __storage_queue_put_serialized(this._scope, key, __storedBytes(value, error));
+        }
+      }
+      await Promise.resolve();
+      this._flushPendingPuts();
+      return;
+    }
     try {
       __storage_queue_put_many(this._scope, entries);
     } catch (error) {
@@ -2103,12 +2125,13 @@ let __nextFacetOwner = 1;
 // here is a bag nothing validated, and reading one key out of it is how every
 // other key came to be dropped in silence. The loader stub validates the bag
 // and encodes its value before it creates the class.
-const __makeDurableObjectClass = (loadPromise, name, propsSc) => {
+const __makeDurableObjectClass = (loadPromise, name, propsSc, script) => {
   const value = {};
   __durableClassMeta.set(value, {
     loadPromise,
     name: name === null || name === undefined ? "default" : String(name),
     propsSc,
+    script: script === undefined ? __cell.script : script,
   });
   return value;
 };
@@ -2127,10 +2150,11 @@ const __makeLoopbackDurableObjectClass = (name) => {
         (props === null || (typeof props !== "object" && typeof props !== "function")))
       throw new TypeError("DurableObjectClass props must be an object.");
     return __makeDurableObjectClass(
-      loadPromise, name, __rpcOut(props === undefined ? {} : props, false));
+      loadPromise, name, __rpcOut(props === undefined ? {} : props, false),
+      __cell.script);
   };
   __durableClassMeta.set(specialize, {
-    loadPromise, name, propsSc: __rpcOut({}, false),
+    loadPromise, name, propsSc: __rpcOut({}, false), script: __cell.script,
   });
   return specialize;
 };
@@ -2208,7 +2232,7 @@ class DurableObjectFacets {
             "Pipelined property paths on facets are not supported yet.");
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          propsSc, path[0], __rpcOut(args, false),
+          propsSc, path[0], __rpcOut(args, true),
           __currentRestoreParent() ?? 0));
       }),
     };
@@ -3798,6 +3822,7 @@ const __rpcUnsupportedType = (value) => new DOMException(
 const __rpcProject = (value) => {
   const seen = new Map();
   const originals = new WeakMap();
+  let hasClasses = false;
   const set = (target, key, value) => Object.defineProperty(target, key, {
     value, enumerable: true, configurable: true, writable: true,
   });
@@ -3806,6 +3831,13 @@ const __rpcProject = (value) => {
       return v;
     const cached = seen.get(v);
     if (cached !== undefined) return cached;
+    // A DurableObjectClass is a plain handle whose identity lives in a
+    // WeakMap, so a plain clone would silently send {}. Mark it so the
+    // caller takes the lifting path (__stubLift mints a class marker).
+    if (__durableClassMeta.has(v)) {
+      hasClasses = true;
+      return v;
+    }
     if (typeof v === "function" || v instanceof __cf.RpcTarget ||
         __stubMeta.has(v) || __svcMeta.has(v) || __doStubMeta.has(v) ||
         v instanceof Headers || v instanceof Blob || v instanceof Request ||
@@ -3848,7 +3880,7 @@ const __rpcProject = (value) => {
     for (const key of Object.keys(v)) set(out, key, project(v[key]));
     return out;
   };
-  return { tree: project(value), originals };
+  return { tree: project(value), originals, hasClasses };
 };
 const __tagged = (tag, sc) => {
   const out = new Uint8Array(sc.length + 1);
@@ -4153,8 +4185,10 @@ const __stubResolve = (target, prop) => {
     if (typeof prop !== "string") return undefined;
     return target[prop];
   }
-  if (target instanceof __cf.RpcTarget) {
-    // A Proxy that reports the RpcTarget prototype is a wildcard receiver:
+  if (target instanceof __cf.RpcTarget ||
+      target instanceof __cf.WorkerEntrypoint ||
+      target instanceof __cf.DurableObject) {
+    // A Proxy that reports an RPC receiver prototype is a wildcard receiver:
     // its [[Get]] answers every method name (the shape cloudflare-os uses
     // to carry a facet stub). Own-property visibility would reject each
     // method, so only the prototype's names stay off limits.
@@ -4380,7 +4414,8 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     if (cached !== undefined) return cached;
     const remote = __remoteStubMeta.get(v);
     if (remote !== undefined) {
-      if (!allowCapabilities) return v;
+      // A foreign stub is already a host-verified HMAC token: re-emitting it
+      // is safe on any transport, including a stateless entrypoint reply.
       if (remote.disposed) throw __stubDisposedError();
       lifted = true;
       caps = true;
@@ -4415,16 +4450,44 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
-      if (!allowCapabilities) return v;
-      // A loopback service stub (ctx.exports): name + props cross
-      // as plain data and revive as a fresh loopback stub. Props
-      // are lifted too -- they may nest further stubs (Workerd's
-      // nested channel tokens).
+      // A ctx.exports stub (loopback service, or a remote one revived as a
+      // service binding) is a durable identity: script + entrypoint + props
+      // re-mint it anywhere. It therefore crosses even where transient
+      // capability handles cannot (a stateless entrypoint reply). Props are
+      // lifted too -- they may nest further stubs.
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      const marker = {
+        "__celld$svc": svc.name, s: __cell.script, t: __stubIsolate,
+      };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
+      return marker;
+    }
+    const outbound = __outboundMeta.get(v);
+    if (outbound !== undefined && outbound.script !== undefined) {
+      // A service binding stub (an env binding or a revived ctx.exports
+      // stub): same durable identity, with its props already encoded.
+      lifted = true;
+      caps = true;
+      const marker = {
+        "__celld$svc": outbound.entrypoint ?? "default",
+        s: outbound.script,
+      };
+      seen.set(v, marker);
+      if (outbound.propsSc !== undefined) marker.pSc = outbound.propsSc;
+      return marker;
+    }
+    const cls = __durableClassMeta.get(v);
+    if (cls !== undefined) {
+      // A DurableObjectClass has durable identity: its script, class name
+      // and encoded props re-mint it in any isolate (the receiver asks the
+      // host for a loader that runs that script).
+      lifted = true;
+      caps = true;
+      const marker = { "__celld$class": cls.name, s: cls.script ?? __cell.script };
+      seen.set(v, marker);
+      if (cls.propsSc !== undefined) marker.pSc = cls.propsSc;
       return marker;
     }
     // Workerd refuses to serialize its promise/property handles.
@@ -4662,10 +4725,33 @@ const __stubRevive = (value) => {
     if (capToken !== undefined)
       return __foreignStub(capToken, undefined, v.p === 1);
     const svcName = v["__celld$svc"];
-    if (svcName !== undefined)
-      return v.t === __stubIsolate
-        ? __entrypointStub(svcName, revive(v.p))
-        : __foreignStub();
+    if (svcName !== undefined) {
+      const props = revive(v.p);
+      const script = v.s;
+      // A same-script loopback stub stays local (no host hop). Anything
+      // else re-mints the durable identity as a service binding.
+      if (v.pSc === undefined && v.t === __stubIsolate &&
+          (script === undefined || script === __cell.script))
+        return __entrypointStub(svcName, props);
+      const propsSc = v.pSc !== undefined
+        ? v.pSc
+        : props === undefined ? undefined : __rpcOut(props, false);
+      return __makeServiceBinding(
+        script ?? __cell.script,
+        svcName === "default" ? null : svcName,
+        propsSc);
+    }
+    const clsName = v["__celld$class"];
+    if (clsName !== undefined) {
+      const script = v.s ?? __cell.script;
+      if (script === __cell.script) {
+        return __makeDurableObjectClass(
+          Promise.resolve({ id: 0 }), clsName, v.pSc, script);
+      }
+      return __makeDurableObjectClass(
+        __script_loader(script).then(Number).then((id) => ({ id })),
+        clsName, v.pSc, script);
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
       const namespace = __cell.makeNamespace(doClass);
@@ -4820,9 +4906,19 @@ const __entrypointResolve = (inst, prop) => {
   if (__entrypointReserved.has(prop))
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
-  if (Object.hasOwn(inst, prop) || !(prop in inst) ||
-      prop in Object.prototype)
+  // A constructor may return a wildcard Proxy that reports an RPC receiver
+  // prototype (gatekeeper loopbacks do): its [[Get]] answers every method,
+  // so own-property visibility would reject the whole session.
+  const wildcard = __util_proxy_details(inst) !== undefined &&
+    (inst instanceof __cf.RpcTarget || inst instanceof __cf.WorkerEntrypoint ||
+      inst instanceof __cf.DurableObject);
+  if (wildcard) {
+    if (prop === "then" || prop in Object.prototype)
+      throw __rpcNoSuchMethod(prop);
+  } else if (Object.hasOwn(inst, prop) || !(prop in inst) ||
+      prop in Object.prototype) {
     throw __rpcNoSuchMethod(prop);
+  }
   const value = inst[prop];
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
@@ -5035,6 +5131,8 @@ const __makeNode = (session, path, ctx) => {
   return new Proxy(function () {}, {
     getPrototypeOf: () => brand.prototype,
     get: (_b, p) => {
+      if (p === Symbol.dispose) return () => {};
+      if (p === Symbol.asyncDispose) return async () => {};
       if (p === "then")
         return (onOk, onErr) => value().then(onOk, onErr);
       if (p === "catch") return (onErr) => value().catch(onErr);
@@ -5145,6 +5243,39 @@ const __entrypointStub = (name, props) => {
 // this script and no user value can decode to it, so revival
 // cannot be spoofed by data shaped like a marker.
 const __storedSentinel = {};
+// A class handle is a plain object, so a plain clone would silently store {}.
+// Probe for one before the native storage put takes the fast path.
+const __hasDurableClass = (value) => {
+  const seen = new Set();
+  const walk = (v) => {
+    if (v === null || (typeof v !== "object" && typeof v !== "function"))
+      return false;
+    if (__durableClassMeta.has(v)) return true;
+    if (__stubMeta.has(v) || __svcMeta.has(v) || __outboundMeta.has(v) ||
+        __remoteStubMeta.has(v) || v instanceof __cf.RpcTarget)
+      return false;
+    if (seen.has(v)) return false;
+    seen.add(v);
+    if (v instanceof Map) {
+      for (const [key, entry] of v)
+        if (walk(key) || walk(entry)) return true;
+      return false;
+    }
+    if (v instanceof Set) {
+      for (const entry of v) if (walk(entry)) return true;
+      return false;
+    }
+    if (Array.isArray(v)) {
+      for (const entry of v) if (walk(entry)) return true;
+      return false;
+    }
+    if (Object.getPrototypeOf(v) === Object.prototype)
+      for (const key of Object.keys(v))
+        if (walk(v[key])) return true;
+    return false;
+  };
+  return walk(value);
+};
 const __storedLift = (value) => {
   let lifted = false;
   const seen = new Map();
@@ -5167,9 +5298,28 @@ const __storedLift = (value) => {
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       lifted = true;
-      const marker = { "__celld$svc": svc.name };
+      const marker = { "__celld$svc": svc.name, s: __cell.script };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
+      return marker;
+    }
+    const outbound = __outboundMeta.get(v);
+    if (outbound !== undefined && outbound.script !== undefined) {
+      lifted = true;
+      const marker = {
+        "__celld$svc": outbound.entrypoint ?? "default",
+        s: outbound.script,
+      };
+      seen.set(v, marker);
+      if (outbound.propsSc !== undefined) marker.pSc = outbound.propsSc;
+      return marker;
+    }
+    const cls = __durableClassMeta.get(v);
+    if (cls !== undefined) {
+      lifted = true;
+      const marker = { "__celld$class": cls.name, s: cls.script ?? __cell.script };
+      seen.set(v, marker);
+      if (cls.propsSc !== undefined) marker.pSc = cls.propsSc;
       return marker;
     }
     if (v instanceof __cf.RpcPromise ||
@@ -5240,8 +5390,29 @@ const __storedRevive = (value) => {
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
     const svcName = v["__celld$svc"];
-    if (svcName !== undefined)
-      return __entrypointStub(svcName, revive(v.p));
+    if (svcName !== undefined) {
+      const props = revive(v.p);
+      const script = v.s;
+      if (v.pSc === undefined && (script === undefined || script === __cell.script))
+        return __entrypointStub(svcName, props);
+      const propsSc = v.pSc !== undefined
+        ? v.pSc
+        : props === undefined ? undefined : __rpcOut(props, false);
+      return __makeServiceBinding(
+        script ?? __cell.script,
+        svcName === "default" ? null : svcName,
+        propsSc);
+    }
+    const clsName = v["__celld$class"];
+    if (clsName !== undefined) {
+      const script = v.s ?? __cell.script;
+      if (script === __cell.script)
+        return __makeDurableObjectClass(
+          Promise.resolve({ id: 0 }), clsName, v.pSc, script);
+      return __makeDurableObjectClass(
+        __script_loader(script).then(Number).then((id) => ({ id })),
+        clsName, v.pSc, script);
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined)
       return __cell.makeNamespace(doClass).get(
@@ -5302,19 +5473,23 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
 // a DataCloneError, exactly as before stubs existed.
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
-  try {
-    return __sc_encode(projected.tree);
-  } catch (error) {
-    // A cross-isolate call lifts only a live signal. A same-isolate call can
-    // also transfer the existing host values and JS capability handles.
-    const lifted = __stubLift(projected.tree, lift, projected.originals);
-    if (lifted === null) throw __dataCloneError(error);
+  let cloneError = null;
+  if (!projected.hasClasses) {
     try {
-      return __tagged(
-        lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
-    } catch (error_) {
-      throw __dataCloneError(error_);
+      return __sc_encode(projected.tree);
+    } catch (error) {
+      cloneError = error;
     }
+  }
+  // A cross-isolate call lifts only a live signal. A same-isolate call can
+  // also transfer the existing host values and JS capability handles.
+  const lifted = __stubLift(projected.tree, lift, projected.originals);
+  if (lifted === null)
+    throw __dataCloneError(cloneError ?? new TypeError("Value is not serializable."));
+  try {
+    return __tagged(lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
+  } catch (error_) {
+    throw __dataCloneError(error_);
   }
 };
 // A callee exception as tagged bytes: the Error crosses by value
@@ -5571,6 +5746,8 @@ class DurableObjectNamespace {
       if (prop === "then") return undefined;
       if (Reflect.has(_target, prop)) return Reflect.get(_target, prop);
       if (prop === "fetch") return doFetch;
+      if (prop === Symbol.dispose) return () => {};
+      if (prop === Symbol.asyncDispose) return async () => {};
       if (typeof prop !== "string") return undefined;
       if (__cell.compat.fetcherGetPutDelete &&
           (prop === "get" || prop === "put" || prop === "delete"))
@@ -5579,11 +5756,18 @@ class DurableObjectNamespace {
       // target. Same-process dispatch re-enters this isolate, where the
       // abort and exit markers revive; bytes that land elsewhere revive as
       // loud foreign stubs.
-      return async (...args) => invoke(async () => {
-        const reply = await __trackHostOp(__rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true)));
-        return __rpcDes(reply);
-      });
+      return (...args) => {
+        // A cell RPC answers with a promise, but Workerd's RPC promise is also
+        // a receiver: reading a property and calling it pipelines the call
+        // onto the eventual result (gatekeeper loopbacks rely on this).
+        const ctx = __ctxNow();
+        const call = invoke(async () => {
+          const reply = await __trackHostOp(__rpc_call(
+            scope, dispatchName ?? null, prop, __rpcOut(args, true)));
+          return __rpcDes(reply);
+        });
+        return __makeNode(__valueSession(call), [], ctx);
+      };
     }});
     __doStubMeta.set(stub, id);
     return stub;
@@ -5713,8 +5897,11 @@ const __rpcTargetMethod = async (scope, method) => {
       "special class `DurableObject`, which can be imported from " +
       "the module \"cloudflare:workers\".");
   const fn = inst[method];
-  if (typeof fn !== "function")
+  if (typeof fn !== "function") {
+    let names = "";
+    try { names = Object.getOwnPropertyNames(Object.getPrototypeOf(inst)).join(","); } catch {}
     throw new TypeError(method + " is not a function");
+  }
   return [inst, fn];
 };
 // Run one capability operation in the isolate that owns the target. The

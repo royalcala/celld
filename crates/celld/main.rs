@@ -25,7 +25,8 @@ use celld::generation::{
 };
 use celld::js::{
     ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
-    QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
+    QueueDispatchReq, RpcCallReq, ScriptLoaderReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions,
+    WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
 use celld::peer_auth::{self, PeerAuth};
@@ -1418,6 +1419,28 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
             celld_logic::cell::valid_cell_scope(&scope),
             "cell scope is malformed or exceeds the fleet storage limit"
         );
+        // A capability owned by an embedded facet has no published cell to
+        // route to. Its root owns the lease and its slot runs the facet, so
+        // dispatch locally under the root's request gate.
+        if let Some(root) = celld::js::facet_root(&scope) {
+            let Routed { request, route } = app
+                .request(root.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!("route facet RPC {scope}: {error:?}"))?;
+            anyhow::ensure!(matches!(route, Route::Local), "facet owner is not local");
+            let local_request_id = local_dispatch_request_id(request_id);
+            let completed = app
+                .local_request(request, root, local_request_id, "local")
+                .run(async {
+                    app.runtime
+                        .as_ref()
+                        .context("no cell runtime")?
+                        .rpc(scope, name, method, args, local_request_id)
+                        .await
+                })
+                .await;
+            return Ok(completed.result.map_err(local_request_error)?.data);
+        }
         let mut dispatcher = RemoteRouteRetry::new(app.operation_deadline_ms);
         loop {
             let Routed { request, route } = app
@@ -2449,6 +2472,22 @@ async fn dispatch_service_call(app: AppHandle, call: SvcCallReq) {
         body_guard.disarm();
     }
     let _ = call.reply.send(response);
+}
+
+async fn dispatch_script_loader(app: AppHandle, call: ScriptLoaderReq) {
+    let result = match &app.runtime {
+        Some(runtime) => match runtime.script_config(call.generation, &call.script) {
+            Some(config) => {
+                celld::js::register_script_loader(call.generation, &call.script, config)
+            }
+            None => Err(format!(
+                "facet host: no co-hosted script named {}",
+                call.script
+            )),
+        },
+        None => Err("no Worker runtime".to_string()),
+    };
+    let _ = call.reply.send(result);
 }
 
 async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
@@ -4345,6 +4384,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         tokio::spawn(async move {
             while let Some(req) = facet_rx.recv().await {
                 tokio::spawn(dispatch_facet(app.clone(), req));
+            }
+        });
+    }
+    let (script_loader_tx, mut script_loader_rx) = mpsc::unbounded_channel();
+    celld::js::set_script_loader_tx(script_loader_tx);
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            while let Some(req) = script_loader_rx.recv().await {
+                tokio::spawn(dispatch_script_loader(app.clone(), req));
             }
         });
     }

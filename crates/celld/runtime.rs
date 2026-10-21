@@ -484,6 +484,9 @@ pub struct StatelessRuntime {
     /// The isolates fetch runs on, entered one turn at a time from whichever
     /// tokio worker is driving the request.
     pub isolates: Arc<crate::pool::Pool>,
+    /// The Worker this service script runs. A facet whose class belongs to a
+    /// co-hosted service script builds a dedicated slot from this config.
+    pub config: Arc<WorkerConfig>,
 }
 
 #[derive(Clone, Copy)]
@@ -1033,6 +1036,18 @@ impl RuntimeManager {
             Some(cancellation.clone()),
         );
         receive_service_fetch_response(response, cancellation, cancel).await
+    }
+
+    /// The WorkerConfig of a co-hosted service script, for a facet whose
+    /// class belongs to that script.
+    pub fn script_config(
+        &self,
+        generation: GenerationId,
+        script: &str,
+    ) -> Option<Arc<crate::js::WorkerConfig>> {
+        self.generation_by_id(generation)
+            .service(script)
+            .map(|service| service.config.clone())
     }
 
     pub async fn rpc_service(
@@ -2026,13 +2041,32 @@ impl RuntimeManager {
         // the Residency, the pool reaps the "drained" isolate, and the
         // resumed event enters a freed worker and aborts the process
         // (denoland/celld#147).
-        self.cells
+        if let Some(handle) = self
+            .cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(cell)
-            .map(|handle| handle.residency.slot().affiliate())
-            .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
+        {
+            return Ok(handle.residency.slot().affiliate());
+        }
+        // An embedded facet is a cell too, but it is not published. Its host
+        // slot runs it; the root's residency pins an own-isolate facet.
+        if let Some(slot) = crate::js::facet_slot(cell) {
+            return Ok(slot.affiliate());
+        }
+        if let Some(root) = crate::js::facet_root(cell) {
+            if let Some(handle) = self
+                .cells
+                .lock()
+                .expect("cell registry poisoned")
+                .published
+                .get(&root)
+            {
+                return Ok(handle.residency.slot().affiliate());
+            }
+        }
+        anyhow::bail!("cell runtime is not published: {cell}")
     }
 
     /// Reserve one fetch against a published cell and return its isolate
@@ -2822,6 +2856,7 @@ impl StatelessRuntime {
             isolates,
             node,
             region,
+            config,
         })
     }
 

@@ -87,7 +87,6 @@ pub use crate::host_channels::set_outbound_ws_tx;
 pub use crate::host_channels::set_queue_dispatch_tx;
 pub use crate::host_channels::set_rpc_call_tx;
 pub use crate::host_channels::set_svc_call_tx;
-pub use crate::host_channels::set_svc_rpc_tx;
 pub use crate::host_channels::AssetCallReq;
 pub use crate::host_channels::FacetReq;
 pub use crate::host_channels::GateReq;
@@ -104,7 +103,8 @@ pub(crate) use crate::host_channels::GATE_TX;
 pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
 pub(crate) use crate::host_channels::RPC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_CALL_TX;
-pub(crate) use crate::host_channels::SVC_RPC_TX;
+pub use crate::host_channels::{set_script_loader_tx, set_svc_rpc_tx, ScriptLoaderReq};
+pub(crate) use crate::host_channels::{SCRIPT_LOADER_TX, SVC_RPC_TX};
 pub(crate) use crate::http_streams::claim_http_stream;
 pub(crate) use crate::http_streams::encode_http_response;
 pub(crate) use crate::http_streams::http_stream_read;
@@ -7011,6 +7011,7 @@ ops! { OP_NAMES, install_op_functions,
         "__alarm_get" => op_alarm_get,
         "__alarm_delete" => op_alarm_delete,
         "__loader_load" => op_loader_load,
+        "__script_loader" => op_script_loader,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
         "__loader_drop" => op_loader_drop,
@@ -7921,6 +7922,94 @@ fn op_loader_load(
     rv.set(v8::Number::new(scope, id as f64).into());
 }
 
+/// One facet host per (service script, generation). A `DurableObjectClass`
+/// minted by `ctx.exports` in a co-hosted service script crosses RPC as a
+/// script + class + props marker; the receiver asks the host for a loader id
+/// that runs that script, and `ctx.facets` then starts the facet there. The
+/// facet's storage still belongs to the root that opened it.
+struct ScriptLoaderEntry {
+    owner: LoaderOwner,
+    loader: u64,
+}
+
+static SCRIPT_LOADERS: OnceLock<Mutex<HashMap<String, ScriptLoaderEntry>>> = OnceLock::new();
+
+fn script_loaders() -> &'static Mutex<HashMap<String, ScriptLoaderEntry>> {
+    SCRIPT_LOADERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install (or reuse) the dedicated isolate a service script's classes run
+/// their facets in. Called by the host, which can resolve the script's
+/// WorkerConfig from the generation.
+pub fn register_script_loader(
+    generation: crate::generation::GenerationId,
+    script: &str,
+    config: Arc<WorkerConfig>,
+) -> Result<u64, String> {
+    if let Some(entry) = script_loaders().lock().unwrap().get(script) {
+        if entry.owner.principal.generation == generation {
+            return Ok(entry.loader);
+        }
+    }
+    if let Some(entry) = script_loaders().lock().unwrap().remove(script) {
+        // A redeploy supersedes the old isolate; drop it off this thread.
+        let states = take_loader_owner(&entry.owner);
+        if !states.is_empty() {
+            tokio::task::spawn_blocking(move || drop(states));
+        }
+    }
+    let handle =
+        tokio::runtime::Handle::try_current().map_err(|error| format!("facet host: {error}"))?;
+    let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+    let owner = LoaderOwner::fresh(script, generation);
+    let loader = admit_loaded_worker(owner.clone(), state)?;
+    handle.spawn(async move {
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::loaded_worker(worker)),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("facet host: {error}"))),
+            Err(error) => {
+                LoaderState::Failed(Arc::from(format!("facet host: load task failed: {error}")))
+            }
+        };
+        loaded.send_replace(state);
+    });
+    script_loaders()
+        .lock()
+        .unwrap()
+        .insert(script.to_string(), ScriptLoaderEntry { owner, loader });
+    Ok(loader)
+}
+
+/// `__script_loader(script)` -> Promise<loader id>. Resolved by the host,
+/// which owns the generation the script belongs to.
+fn op_script_loader(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let script = args.get(0).to_rust_string_lossy(scope);
+    let generation = current_generation(scope);
+    let id = asyncrt::enqueue(async move {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let Some(sender) = SCRIPT_LOADER_TX.get() else {
+            return Err("facet host: host channel unavailable".to_string());
+        };
+        sender
+            .send(ScriptLoaderReq {
+                generation,
+                script,
+                reply,
+            })
+            .map_err(|_| "facet host: host channel closed".to_string())?;
+        match receive.await {
+            Ok(Ok(loader)) => Ok(asyncrt::OpOut::Str(loader.to_string())),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(format!("facet host: {error}")),
+        }
+    });
+    rv.set(promise_for(scope, id));
+}
+
 /// `__loader_fetch(id, url, method, body, headersJson, streamId, entrypoint,
 /// propsSc, limitsJson, tailReporting, cancellable)` -> Promise<json> or
 /// [Promise<json>, Promise<json>].
@@ -8506,6 +8595,27 @@ fn take_recorded_facets_below(root: &str, epoch: u64, path: &[String]) -> Vec<Re
     }
     below.sort_by_key(|open| std::cmp::Reverse(open.path.len()));
     below
+}
+
+/// The host slot of a facet that runs in a loaded Worker's isolate. A facet
+/// in the root's own isolate has no entry here: its root's residency pins the
+/// slot instead.
+pub(crate) fn facet_slot(scope: &str) -> Option<Arc<crate::pool::Slot>> {
+    let roots = root_facets();
+    for entry in roots.values() {
+        if entry.stopped {
+            continue;
+        }
+        if let Some(open) = entry.open.iter().find(|open| open.scope == scope) {
+            return Some(open.slot.clone());
+        }
+    }
+    None
+}
+
+/// The root cell that owns `scope`, for facets opened through ctx.facets.
+pub fn facet_root(scope: &str) -> Option<String> {
+    facet_roots().get(scope).cloned()
 }
 
 /// The loaded isolate that runs the facet `scope` of `root` at `epoch`, while

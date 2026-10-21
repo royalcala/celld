@@ -129,6 +129,19 @@ pub struct SvcRpcReq {
 pub(crate) static SVC_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcRpcReq>> =
     OnceLock::new();
 
+/// Resolve a `DurableObjectClass` that belongs to a co-hosted service script
+/// to a loader id running that script. The host owns the generation, so the
+/// isolate asks it rather than reading another script's config itself.
+pub struct ScriptLoaderReq {
+    /// The calling isolate's application generation.
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+}
+
+pub(crate) static SCRIPT_LOADER_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<ScriptLoaderReq>> =
+    OnceLock::new();
+
 /// The persisted identity a consumer settlement must match for one message.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QueueLeaseRef {
@@ -170,6 +183,10 @@ pub(crate) fn kv_blob_store() -> std::result::Result<&'static crate::bucket::Buc
 
 pub fn set_svc_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcRpcReq>) {
     let _ = SVC_RPC_TX.set(tx);
+}
+
+pub fn set_script_loader_tx(tx: tokio::sync::mpsc::UnboundedSender<ScriptLoaderReq>) {
+    let _ = SCRIPT_LOADER_TX.set(tx);
 }
 pub fn set_svc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcCallReq>) {
     let _ = SVC_CALL_TX.set(tx);
