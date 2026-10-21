@@ -1,0 +1,12 @@
+{
+  "name": "persistent-stubs",
+  "main": "index.js",
+  "compatibility_date": "2026-09-04",
+  "compatibility_flags": ["allow_irrevocable_stub_storage"],
+  "durable_objects": {
+    "bindings": [{ "name": "ROOT", "class_name": "Root" }]
+  },
+  "migrations": [
+    { "tag": "v0", "new_sqlite_classes": ["Root", "Facet"] }
+  ]
+}

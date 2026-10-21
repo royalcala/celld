@@ -1,0 +1,9 @@
+{
+  "name": "cancellation",
+  "main": "index.js",
+  "compatibility_date": "2026-09-04",
+  "durable_objects": {
+    "bindings": [{ "name": "TEST_DO", "class_name": "TestDO" }]
+  },
+  "migrations": [{ "tag": "v0", "new_sqlite_classes": ["TestDO"] }]
+}
