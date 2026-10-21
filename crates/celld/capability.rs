@@ -639,6 +639,45 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_release_disposes_exactly_once() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let refs = Arc::new(Mutex::new(CapabilityRefs::default()));
+        for _ in 0..8 {
+            refs.lock().unwrap().retain("scope-a", 5);
+        }
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let refs = Arc::clone(&refs);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                refs.lock().unwrap().release("scope-a", 5)
+            }));
+        }
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("thread"))
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Some(true))
+                .count(),
+            1,
+            "exactly one release owns the dispose"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Some(false))
+                .count(),
+            7
+        );
+        assert!(refs.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn exported_refs_are_shared_by_owner_and_handle() {
         let mut refs = CapabilityRefs::default();
         assert_eq!(refs.retain("scope-a", 3), 1);

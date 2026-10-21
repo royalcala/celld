@@ -1398,6 +1398,89 @@ fn promise_store(scope: &mut v8::PinScope, id: u64, r: v8::Global<v8::PromiseRes
         .insert(id, r);
 }
 
+/// Ops report typed failures to JavaScript by prefixing the message with a
+/// control byte, a domain, and a code. `resolve_res` strips the prefix and
+/// sets `name`/`code` on the rejected Error, so callers branch on the code
+/// instead of matching message text (which is localized and may change).
+const RPC_ERROR_PREFIX: &str = "\u{1}celld-rpc:";
+
+/// One typed RPC failure on the wire. `code` is the stable, documented value.
+fn rpc_error(code: &str, message: impl std::fmt::Display) -> String {
+    format!("{RPC_ERROR_PREFIX}{code}:{message}")
+}
+
+/// Split a typed op failure. Plain failures (the overwhelming majority) have
+/// no prefix and keep their message untouched.
+fn split_rpc_error(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix(RPC_ERROR_PREFIX)?;
+    let (code, message) = rest.split_once(':')?;
+    Some((code, message))
+}
+
+fn rpc_error_name(code: &str) -> &'static str {
+    match code {
+        "owner-gone" => "RpcOwnerGoneError",
+        "owner-moved" => "RpcOwnerMovedError",
+        "disposed" => "RpcDisposedError",
+        "forbidden" => "RpcForbiddenError",
+        "transport" => "RpcTransportError",
+        "overloaded" => "RpcOverloadedError",
+        _ => "Error",
+    }
+}
+
+/// Classify a host-side routing failure into the codes a client can act on.
+///
+/// Only the host sees these messages (they come from routing, the peer tunnel
+/// and the cell registry), so this is a boundary conversion, not a client-side
+/// string match. Unknown failures default to `owner-gone`: the operation did
+/// not run.
+fn classify_owner_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("overload") {
+        "overloaded"
+    } else if lower.contains("remained stale")
+        || lower.contains("owner was stale")
+        || lower.contains("not published at epoch")
+        || lower.contains("stale route")
+    {
+        "owner-moved"
+    } else if lower.contains("transport")
+        || lower.contains("no rpc channel")
+        || lower.contains("proxy dropped")
+        || lower.contains("peer")
+    {
+        "transport"
+    } else if lower.contains("malformed") || lower.contains("forbidden") {
+        "forbidden"
+    } else {
+        "owner-gone"
+    }
+}
+
+fn set_rpc_error_fields(tc: &mut v8::PinScope, exception: v8::Local<v8::Value>, message: &str) {
+    let (code, _) = split_rpc_error(message).unwrap_or(("", message));
+    if let Some(object) = exception.to_object(tc) {
+        let set = |key: &str, value: &str| {
+            let key = v8::String::new(tc, key).unwrap();
+            let value = v8::String::new(tc, value).unwrap();
+            let _ = object.set(tc, key.into(), value.into());
+        };
+        set("code", code);
+        set("name", rpc_error_name(code));
+    }
+}
+
+/// Throw a typed, synchronous failure (bad token, bad path, disallowed kind).
+fn loader_throw_typed(scope: &mut v8::PinScope, code: &str, message: &str) {
+    let message = rpc_error(code, message);
+    let (_, text) = split_rpc_error(&message).unwrap_or(("", message.as_str()));
+    let text = v8::String::new(scope, text).unwrap();
+    let exception = v8::Exception::error(scope, text);
+    set_rpc_error_fields(scope, exception, &message);
+    scope.throw_exception(exception);
+}
+
 /// Resolve or reject op `id`'s promise with its outcome.
 fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, String>) {
     let g = match actor_runtime_state(tc).promises.lock().unwrap().remove(&id) {
@@ -1415,8 +1498,10 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
             r.resolve(tc, v);
         }
         Err(e) => {
-            let s = v8::String::new(tc, &e).unwrap();
+            let (_, text) = split_rpc_error(&e).unwrap_or(("", e.as_str()));
+            let s = v8::String::new(tc, text).unwrap();
             let ex = v8::Exception::error(tc, s);
+            set_rpc_error_fields(tc, ex, &e);
             r.reject(tc, ex);
         }
     }
@@ -9198,14 +9283,25 @@ fn enqueue_stub_rpc(
         reply: tx,
     };
     asyncrt::enqueue(async move {
-        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
+        if let Err(error) = gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
+        {
+            return Err(rpc_error("transport", error));
+        }
         match rx.await {
             Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
-            Ok(Ok(RpcData::Json(_))) => {
-                Err("RPC answered JSON to a structured-clone stub call".into())
+            Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
+                "transport",
+                "RPC answered JSON to a structured-clone stub call",
+            )),
+            Ok(Err(error)) => {
+                let message = format!("{error}");
+                let code = classify_owner_error(&message);
+                Err(rpc_error(code, message))
             }
-            Ok(Err(e)) => Err(format!("{e}")),
-            Err(e) => Err(format!("RPC proxy dropped: {e}")),
+            Err(error) => Err(rpc_error(
+                "transport",
+                format!("RPC proxy dropped: {error}"),
+            )),
         }
     })
 }
@@ -9221,10 +9317,15 @@ fn enqueue_stub_rpc_stateless(
     let handle = claims.handle;
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     asyncrt::enqueue(async move {
-        let gone = || "RPC target's isolate is gone, or is on another celld node.".to_string();
+        let gone = || {
+            rpc_error(
+                "owner-gone",
+                "RPC target's isolate is gone, or is on another celld node.",
+            )
+        };
         await_egress_gate(gate)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| rpc_error("transport", error))?;
         let slot = stub_owner_slot(&owner).ok_or_else(gone)?;
         // Affiliate before checking, so the pool cannot free the isolate
         // between the check and the drive; held until the call is done.
@@ -9242,10 +9343,15 @@ fn enqueue_stub_rpc_stateless(
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
         match receive.await {
             Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(error)) => Err(format!("{error}")),
+            // The isolate answered a rejected promise. The harness wraps owner
+            // exceptions in an RPC envelope, so this is a host-side failure.
+            Ok(Err(error)) => Err(rpc_error("owner-gone", error)),
             Err(_) => match driving.await {
-                Err(error) => Err(format!("stub RPC task died: {error}")),
-                Ok(()) => Err("stub RPC owner dropped its result".to_string()),
+                Err(error) => Err(rpc_error(
+                    "transport",
+                    format!("stub RPC task died: {error}"),
+                )),
+                Ok(()) => Err(rpc_error("transport", "stub RPC owner dropped its result")),
             },
         }
     })
@@ -9332,7 +9438,7 @@ fn op_stub_rpc_call_token(
     let claims = match capability_key().verify(&token) {
         Ok(claims) => claims,
         Err(error) => {
-            loader_throw(scope, &error.to_string());
+            loader_throw_typed(scope, "forbidden", &error.to_string());
             return;
         }
     };
@@ -9348,14 +9454,15 @@ fn op_stub_rpc_call_token(
         }
         CapabilityKind::Stateless => {
             let Ok(path) = serde_json::from_str::<Option<Vec<String>>>(&path) else {
-                loader_throw(scope, "capability path is not valid JSON");
+                loader_throw_typed(scope, "forbidden", "capability path is not valid JSON");
                 return;
             };
             let id = enqueue_stub_rpc_stateless(scope, &claims, path, args_bytes);
             rv.set(promise_for(scope, id));
         }
-        _ => loader_throw(
+        _ => loader_throw_typed(
             scope,
+            "forbidden",
             "this capability kind cannot cross isolate boundaries yet",
         ),
     }
@@ -13174,3 +13281,46 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(test)]
+mod rpc_error_tests {
+    use super::*;
+
+    #[test]
+    fn typed_prefix_round_trips() {
+        let message = rpc_error("owner-gone", "the owner is gone");
+        assert_eq!(
+            split_rpc_error(&message),
+            Some(("owner-gone", "the owner is gone"))
+        );
+        assert_eq!(rpc_error_name("owner-moved"), "RpcOwnerMovedError");
+        assert_eq!(rpc_error_name("disposed"), "RpcDisposedError");
+        assert_eq!(split_rpc_error("plain failure"), None);
+    }
+
+    #[test]
+    fn host_failures_are_classified() {
+        assert_eq!(
+            classify_owner_error("remote RPC owner remained stale until the retry deadline"),
+            "owner-moved"
+        );
+        assert_eq!(
+            classify_owner_error("cell runtime is not published at epoch 3: X"),
+            "owner-moved"
+        );
+        assert_eq!(
+            classify_owner_error("remote RPC transport failed: eof"),
+            "transport"
+        );
+        assert_eq!(classify_owner_error("no RPC channel"), "transport");
+        assert_eq!(
+            classify_owner_error("cell scope is malformed or exceeds the fleet storage limit"),
+            "forbidden"
+        );
+        assert_eq!(
+            classify_owner_error("cell runtime is not published: X"),
+            "owner-gone"
+        );
+        assert_eq!(classify_owner_error("cell overloaded"), "overloaded");
+    }
+}

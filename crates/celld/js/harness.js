@@ -2886,7 +2886,7 @@ class DurableObjectState {
         "ctx.restore params must be structured-cloneable without live stubs.",
         { cause: error });
     }
-    return __foreignStub(__restore_mint(paramsSc));
+    return __foreignStub(__restore_mint(paramsSc), undefined, true);
   }
 }
 function _instance(scope) {
@@ -4043,8 +4043,21 @@ const __disposeStub = (meta) => {
   if (typeof disposer === "function")
     Promise.resolve().then(() => disposer.call(entry.target));
 };
+// Errors that cross an RPC boundary carry a stable `code` (and a matching
+// `name`), set either here or by the host in `resolve_res`. Callers switch on
+// the code; no one has to match message text, which is diagnostic only.
+const __rpcCodedError = (name, code, message) => {
+  const error = new Error(message);
+  error.name = name;
+  error.code = code;
+  return error;
+};
 const __stubDisposedError = () =>
-  new Error("RPC stub used after being disposed.");
+  __rpcCodedError("RpcDisposedError", "disposed",
+    "RPC stub used after being disposed.");
+const __rpcDisposedError = () =>
+  __rpcCodedError("RpcDisposedError", "disposed",
+    "RPC target is no longer available on this node.");
 // Shared brand value for RpcTarget instances; see the RpcTarget
 // constructor.
 const __rpcNoClone = () => {};
@@ -4053,8 +4066,12 @@ const __rpcNoClone = () => {};
 // never Object.prototype); a plain object or function exposes own
 // properties only. Property reads go through normal [[Get]] so
 // Proxy handlers participate, as in Workerd.
-const __rpcNoSuchMethod = (prop) => new TypeError(
-  'The RPC receiver does not implement the method "' + prop + '".');
+const __rpcNoSuchMethod = (prop) => {
+  const error = new TypeError(
+    'The RPC receiver does not implement the method "' + prop + '".');
+  error.code = "method-not-found";
+  return error;
+};
 // Bind through the intrinsic because a callable proxy can implement `.bind`
 // as a remote property. Reading that property can turn a valid named RPC
 // method into a non-function. Keep this rule shared by every RPC binding site.
@@ -4299,6 +4316,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       // The sender keeps its reference; the receiver gets a new one.
       __cap_retain(remote.token);
       const marker = { "__celld$cap": remote.token };
+      if (remote.durable) marker.p = 1;
       seen.set(v, marker);
       return marker;
     }
@@ -4570,7 +4588,8 @@ const __stubRevive = (value) => {
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
     const capToken = v["__celld$cap"];
-    if (capToken !== undefined) return __foreignStub(capToken);
+    if (capToken !== undefined)
+      return __foreignStub(capToken, undefined, v.p === 1);
     const svcName = v["__celld$svc"];
     if (svcName !== undefined)
       return v.t === __stubIsolate
@@ -4621,10 +4640,19 @@ const __stubRevive = (value) => {
 // A capability token minted by another isolate. Every operation round-trips
 // through the host, which verifies the token and routes it as a native DO RPC
 // call; the caller never learns the scope or the entry id.
-const __rpcBrokenMessage = (error) =>
-  /no longer available|RPC proxy dropped|no RPC channel|Durable Object.*not found|owner.*gone/i
-    .test(String(error?.message ?? error));
-const __foreignStub = (token, state) => {
+//
+// `onRpcBroken` fires on the stable codes of failures that cannot heal: the
+// owner is gone or moved, the transport dropped, or the token is forbidden.
+// A disposed stub is not "broken" -- the caller did that -- and an overloaded
+// owner stays retryable.
+const __rpcBrokenCodes = new Set([
+  "owner-gone", "owner-moved", "transport", "forbidden",
+]);
+const __isRpcBrokenError = (error) =>
+  __rpcBrokenCodes.has(error?.code);
+// `durable` marks a handle minted by `ctx.restore`: its token names a durable
+// row, so it may be stored in Durable Object storage and replayed later.
+const __foreignStub = (token, state, durable = false, stored = false) => {
   if (token === undefined) {
     return new Proxy(function () {}, {
       get: (_b, prop) => {
@@ -4637,9 +4665,11 @@ const __foreignStub = (token, state) => {
     });
   }
   state ??= { broken: false, error: undefined, callbacks: [] };
-  const meta = { token, disposed: false, state };
+  const meta = {
+    token, disposed: false, state, durable, stored, rejectors: new Set(),
+  };
   const track = (promise) => promise.catch((error) => {
-    if (!state.broken && __rpcBrokenMessage(error)) {
+    if (!state.broken && __isRpcBrokenError(error)) {
       state.broken = true;
       state.error = error;
       for (const callback of state.callbacks.splice(0)) {
@@ -4648,12 +4678,26 @@ const __foreignStub = (token, state) => {
     }
     throw error;
   });
+  // Disposal releases whatever the caller is still waiting on, so a dropped
+  // stub cannot leave a queue of calls parked on a reply that will never be
+  // used. The owner's own operation is bounded by the host call.
+  const guard = (promise) => {
+    if (meta.disposed) return Promise.reject(__stubDisposedError());
+    return new Promise((resolve, reject) => {
+      const rejectDisposed = (error) => reject(error);
+      meta.rejectors.add(rejectDisposed);
+      promise.then(
+        (value) => { meta.rejectors.delete(rejectDisposed); resolve(value); },
+        (error) => { meta.rejectors.delete(rejectDisposed); reject(error); },
+      );
+    });
+  };
   const session = {
-    get: (path) => track(__stub_rpc_call_token(
-      token, JSON.stringify(path), null).then((bytes) => __rpcDes(bytes))),
-    call: (path, args) => track(__stub_rpc_call_token(
+    get: (path) => track(guard(__stub_rpc_call_token(
+      token, JSON.stringify(path), null).then((bytes) => __rpcDes(bytes)))),
+    call: (path, args) => track(guard(__stub_rpc_call_token(
       token, JSON.stringify(path), __rpcOut(args, true),
-    ).then((bytes) => __rpcDes(bytes))),
+    ).then((bytes) => __rpcDes(bytes)))),
   };
   const stub = new Proxy(function () {}, {
     getPrototypeOf: () => __cf.RpcStub.prototype,
@@ -4662,13 +4706,19 @@ const __foreignStub = (token, state) => {
       if (prop === Symbol.dispose) return () => {
         if (meta.disposed) return;
         meta.disposed = true;
+        for (const reject of meta.rejectors) reject(__stubDisposedError());
+        meta.rejectors.clear();
         __remoteStubFinalizer.unregister(meta);
-        try { __cap_release(token); } catch {}
+        // A stub read back from storage does not own a reference; the stored
+        // row does. Disposing this handle must not delete the durable row.
+        if (!meta.stored) {
+          try { __cap_release(token); } catch {}
+        }
       };
       if (prop === "dup") return () => {
         if (meta.disposed) throw __stubDisposedError();
         __cap_retain(token);
-        return __foreignStub(token, state);
+        return __foreignStub(token, state, durable);
       };
       if (prop === "onRpcBroken") return (callback) => {
         if (state.broken) callback(state.error);
@@ -4678,12 +4728,12 @@ const __foreignStub = (token, state) => {
       return __makeNode(session, [prop], __ctxNow());
     },
     apply: (_b, _this, args) => __makeNode(
-      __valueSession(track(__stub_rpc_call_token(
+      __valueSession(track(guard(__stub_rpc_call_token(
         token, "[]", __rpcOut(args, true),
-      ).then((bytes) => __rpcDes(bytes)))), [], __ctxNow()),
+      ).then((bytes) => __rpcDes(bytes))))), [], __ctxNow()),
   });
   __remoteStubMeta.set(stub, meta);
-  __remoteStubFinalizer.register(stub, token, meta);
+  if (!meta.stored) __remoteStubFinalizer.register(stub, token, meta);
   return stub;
 };
 // Workerd's entrypoint method-visibility rules (worker-rpc.c++):
@@ -5057,6 +5107,28 @@ const __storedLift = (value) => {
         (v instanceof __cf.RpcPromise ? "RpcPromise" : "RpcProperty") +
         '". This type does not support serialization.',
         "DataCloneError");
+    // A persistent stub (`ctx.restore`) is the one received handle with
+    // durable identity: its token names a row that survives a restart, so
+    // storing the token is exactly Workerd's persistent-stub storage. It is
+    // a function proxy, so this check runs before the clone fallback.
+    const remote = __remoteStubMeta.get(v);
+    if (remote !== undefined) {
+      if (!remote.durable)
+        throw new DOMException(
+          "Durable Object storage can only store stubs with " +
+          "durable identity: persistent stubs from ctx.restore, " +
+          "service stubs from ctx.exports and Durable Object stubs. " +
+          "This value is a transient RPC handle that would not " +
+          "survive a restart.",
+          "DataCloneError");
+      lifted = true;
+      // The stored row owns a reference of its own, so disposing the original
+      // stub (or a read-back handle) cannot delete the row out from under it.
+      __cap_retain(remote.token);
+      const marker = { "__celld$pstub": remote.token };
+      seen.set(v, marker);
+      return marker;
+    }
     if (typeof v === "function") return v; // leave to the clone
     const doId = __doStubMeta.get(v);
     if (doId !== undefined) {
@@ -5102,6 +5174,9 @@ const __storedRevive = (value) => {
     if (doClass !== undefined)
       return __cell.makeNamespace(doClass).get(
         new DurableObjectId(doClass, v.v, v.n ?? undefined));
+    const pstubToken = v["__celld$pstub"];
+    if (pstubToken !== undefined)
+      return __foreignStub(pstubToken, undefined, true, true);
     if (seen.has(v)) return v;
     seen.add(v);
     if (Array.isArray(v)) {
@@ -5572,7 +5647,7 @@ const __rpcTargetMethod = async (scope, method) => {
 const __dispatchStubOp = async (handle, path, argsBytes) => {
   const entry = __stubEntries.get(handle);
   if (entry === undefined || entry.released)
-    throw new Error("RPC target is no longer available on this node.");
+    throw __rpcDisposedError();
   if (path === null) {
     __disposeStub({ entry, disposed: false, ctx: __ctxNow() });
     return __rpcOut(null, true);
@@ -5644,8 +5719,7 @@ const __dispatchRestoreOp = async (handle, path, argsBytes) => {
   }
   const entry = await __restoreEntry(handle);
   if (entry === undefined)
-    throw new Error(
-      "This persistent stub's handle is no longer available.");
+    throw __rpcDisposedError();
   const decoded = argsBytes === null ? null : __rpcDesArgs(argsBytes);
   try {
     return await __ctxRun(entry.ctx, async () => __rpcRun(
@@ -5658,8 +5732,15 @@ const __dispatchRestoreOp = async (handle, path, argsBytes) => {
 };
 // The stateless-owner entrypoint: a WorkerJob::StubRpc event in the isolate
 // that exported the target calls this with the path still as JSON.
-__celld.__dispatchStubRpc = async (id, pathJson, args) =>
-  await __dispatchStubOp(id, JSON.parse(pathJson), args);
+// Answer with the error envelope, not a rejected promise: the host would turn
+// a rejection into a plain string and the caller would lose `name`/`code`.
+__celld.__dispatchStubRpc = async (id, pathJson, args) => {
+  try {
+    return await __dispatchStubOp(id, JSON.parse(pathJson), args);
+  } catch (error) {
+    return __rpcErrOut(error);
+  }
+};
 // The byte path always lifts stub-able values into the reply: the
 // markers carry the isolate token, so they revive only back in this
 // isolate (same-process routed dispatch re-enters it) and fail loudly
@@ -5674,7 +5755,11 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       const handle = Number(rest.slice(0, separator));
       const pathJson = rest.slice(separator + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
-      return await __dispatchStubOp(handle, path, args);
+      try {
+        return await __dispatchStubOp(handle, path, args);
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
     }
     if (method.startsWith("__celldRestoreOp:")) {
       const rest = method.slice("__celldRestoreOp:".length);
@@ -5682,7 +5767,11 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       const handle = Number(rest.slice(0, separator));
       const pathJson = rest.slice(separator + 1);
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
-      return await __dispatchRestoreOp(handle, path, args);
+      try {
+        return await __dispatchRestoreOp(handle, path, args);
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
     }
     // A string is the legacy JSON flavor; bytes are V8 structured clone.
     // Answer in kind.
