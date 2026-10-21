@@ -4061,6 +4061,19 @@ const __tracing = {
     span.end();
     return result;
   },
+  // Workerd also exposes the OTel-style entry points; the agent SDK uses
+  // startActiveSpan(name, callback, options).
+  startActiveSpan(name, callback, options) {
+    return this.enterSpan(name, callback, options);
+  },
+  startSpan(name, options) {
+    const parent = this.getActiveSpan();
+    const requestId = __traceRequestId();
+    const id = __trace_begin(String(name), __traceAttrs(options?.attributes ?? options),
+        parent?._id ?? 0, requestId ?? "");
+    return new __tracing.Span(id, String(name), requestId);
+  },
+  async forceFlush() {},
   getActiveSpan() {
     return __als_get()?.get(__traceSpanKey);
   },
