@@ -3939,6 +3939,145 @@ const __ctxRun = (id, fn) => {
     __als_set(prior);
   }
 };
+// ---- request ids, trace spans and log correlation --------------
+// Every HTTP dispatch gets a request id (the incoming x-celld-request-id or a
+// fresh one), stored in the same AsyncLocalStorage frame as the ctx so it
+// flows through awaits and into nested fetches. The id reaches the Worker as
+// a request header and is echoed on the response; console lines are prefixed
+// with it. Span attributes are scalar-only and capped here and again in the
+// host, which also redacts registered secrets.
+const __traceSpanKey = Symbol("celld.traceSpan");
+const __traceRequestKey = Symbol("celld.requestId");
+const __newRequestId = () => {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+      return crypto.randomUUID();
+  } catch {}
+  return "req-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+};
+const __traceRequestId = () => __als_get()?.get(__traceRequestKey);
+const __withRequestId = (id, fn) => {
+  const prior = __als_get();
+  const frame = new Map(prior);
+  frame.set(__traceRequestKey, id);
+  __als_set(frame);
+  try { return fn(); } finally { __als_set(prior); }
+};
+const __enrichRequest = (request) => {
+  if (request === null || typeof request !== "object" || request.headers === undefined)
+    return { id: __newRequestId(), request };
+  const existing = request.headers.get("x-celld-request-id");
+  const id = existing !== null && existing !== "" ? existing : __newRequestId();
+  if (existing !== null && existing !== "") return { id, request };
+  // Do not clone an upgrade request: the clone would lose the WebSocket.
+  if (request.headers.get("upgrade") !== null) return { id, request };
+  const headers = new Headers(request.headers);
+  headers.set("x-celld-request-id", id);
+  return { id, request: new Request(request, { headers }) };
+};
+const __responseWithRequestId = (response, id) => {
+  if (!(response instanceof Response) || response.status === 101) return response;
+  try {
+    const headers = new Headers(response.headers);
+    headers.set("x-celld-request-id", id);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch {
+    return response;
+  }
+};
+const __traceAttrs = (attributes) => {
+  if (attributes === null || typeof attributes !== "object") return undefined;
+  const out = {};
+  let count = 0;
+  for (const [key, value] of Object.entries(attributes)) {
+    if (count >= 16) break;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      out[String(key).slice(0, 64)] = String(value).slice(0, 256);
+      count++;
+    }
+  }
+  return JSON.stringify(out);
+};
+const __tracing = {
+  Span: class Span {
+    constructor(id, name, requestId) {
+      this._id = id;
+      this._name = name;
+      this._requestId = requestId;
+      this._ended = false;
+    }
+    get name() { return this._name; }
+    get isTraced() { return this._requestId !== undefined; }
+    setAttribute(key, value) {
+      if (!this._ended) __trace_attr(this._id, String(key), String(value));
+    }
+    setAttributes(attributes) {
+      if (this._ended || attributes === null || typeof attributes !== "object") return;
+      for (const [key, value] of Object.entries(attributes))
+        this.setAttribute(key, value);
+    }
+    end() {
+      if (this._ended) return;
+      this._ended = true;
+      __trace_end(this._id, "ok");
+    }
+  },
+  enterSpan(name, callback, options) {
+    if (typeof callback !== "function")
+      throw new TypeError("tracing.enterSpan requires a function");
+    const parent = this.getActiveSpan();
+    const requestId = __traceRequestId();
+    const attributes = options?.attributes ?? options;
+    const id = __trace_begin(
+      String(name), __traceAttrs(attributes), parent?._id ?? 0, requestId ?? "");
+    const span = new __tracing.Span(id, String(name), requestId);
+    const prior = __als_get();
+    const frame = new Map(prior);
+    frame.set(__traceSpanKey, span);
+    __als_set(frame);
+    let result;
+    try {
+      result = callback(span);
+    } catch (error) {
+      __als_set(prior);
+      span._ended = true;
+      __trace_end(id, "error");
+      throw error;
+    }
+    __als_set(prior);
+    if (result !== null && typeof result === "object" &&
+        typeof result.then === "function") {
+      return result.then(
+        (value) => { span.end(); return value; },
+        (error) => {
+          if (!span._ended) { span._ended = true; __trace_end(id, "error"); }
+          throw error;
+        });
+    }
+    span.end();
+    return result;
+  },
+  getActiveSpan() {
+    return __als_get()?.get(__traceSpanKey);
+  },
+  isTraced() {
+    return __traceRequestId() !== undefined;
+  },
+};
+// Correlate console output with the request without letting user code see or
+// rewrite the id. The host still redacts registered secrets and caps lines.
+for (const level of ["log", "info", "warn", "error", "debug"]) {
+  const original = console[level];
+  if (typeof original !== "function" || original.__celldTrace !== undefined) continue;
+  const wrapped = (...args) =>
+    original.apply(console, [`[request_id=${__traceRequestId() ?? "-"}]`, ...args]);
+  wrapped.__celldTrace = true;
+  console[level] = wrapped;
+}
 const __ctxError = (kind) => new Error(
   "Cannot perform I/O on behalf of a different request. I/O " +
   "objects (such as streams, request/response bodies, and others) " +
@@ -4233,6 +4372,7 @@ const __readableBridge = (reader) => {
   const bridge = {
     done: false,
     async read() {
+      __metric_inc("stream_reads");
       let result;
       try {
         result = await reader.read();
@@ -4245,6 +4385,7 @@ const __readableBridge = (reader) => {
     },
     cancel() {
       if (bridge.done) return;
+      __metric_inc("stream_cancels");
       bridge.done = true;
       reader.cancel(__rsDisconnect()).catch(() => {});
     },
@@ -4255,12 +4396,16 @@ const __readableBridge = (reader) => {
 const __writableBridge = (writer) => {
   const bridge = {
     done: false,
-    write: (chunk) => writer.write(chunk),
+    write: (chunk) => {
+      __metric_inc("stream_writes");
+      return writer.write(chunk);
+    },
     close() {
       bridge.done = true;
       return writer.close();
     },
     abort() {
+      if (!bridge.done) __metric_inc("stream_aborts");
       bridge.done = true;
       return writer.abort(__wsDisconnect());
     },
@@ -5849,15 +5994,18 @@ const __dispatchTo = __celld.__dispatchTo = async (
   try {
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
-      return await __ctxRun(undefined, () => inst.fetch(
-        __makeRequest(
-          url,
-          method,
-          body,
-          headersJson,
-          requestController.signal,
-          true,
-        )));
+      __metric_inc("http_requests");
+      const request = __makeRequest(
+        url,
+        method,
+        body,
+        headersJson,
+        requestController.signal,
+        true,
+      );
+      const enriched = __enrichRequest(request);
+      return await __withRequestId(enriched.id, () =>
+        __ctxRun(undefined, () => inst.fetch(enriched.request)));
     })();
     // The caller's abandonment reaches the target through
     // __do_call_cancel/__abortIncomingRequest, which aborts the fresh incoming
@@ -10362,6 +10510,7 @@ const __cf = __celld.__cf = {
   exports: {},
   get env() { return __cell.env; },
 };
+__cf.tracing = __tracing;
 // Proxy standing in for unsupported node:*/cloudflare:* builtins. Property
 // walks stay inert -- real bundles reference these at module scope, and
 // evaluation must not crash on a builtin the fetch path never exercises --
@@ -11811,8 +11960,14 @@ const __entrypointContext = (props = __defaultProps) => ({
 });
 // The default export is called straight from the host, so it needs the
 // request frame here: `ctx.abort()` and I/O confinement both key off it.
-__celld.__callDefaultFetch = (fetch, request, env, ctx) =>
-  __ctxRun(undefined, () => fetch.call(undefined, request, env, ctx));
+__celld.__callDefaultFetch = (fetch, request, env, ctx) => {
+  const enriched = __enrichRequest(request);
+  return __withRequestId(enriched.id, () => __ctxRun(undefined, () => {
+    __metric_inc("http_requests");
+    return Promise.resolve(fetch.call(undefined, enriched.request, env, ctx))
+      .then((response) => __responseWithRequestId(response, enriched.id));
+  }));
+};
 // `secret_key` bindings are ArrayBuffers. The value arrives base64 because the
 // env bootstrap is JavaScript source that may end up in a compile-error
 // message; the host registers that encoding with the redactor.
