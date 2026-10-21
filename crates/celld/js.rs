@@ -15,7 +15,8 @@
 //! `async` by the JS harness.
 use crate::asyncrt;
 use crate::capability::{
-    CapabilityClaims, CapabilityKey, CapabilityKind, CapabilityRefs, FLAG_RESTORE,
+    CapabilityClaims, CapabilityKey, CapabilityKind, CapabilityRefs, FLAG_FACET_RESTORE,
+    FLAG_RESTORE,
 };
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
@@ -7003,6 +7004,9 @@ ops! { OP_NAMES, install_op_functions,
         "__restore_mint" => op_restore_mint,
         "__restore_params" => op_restore_params,
         "__restore_forget" => op_restore_forget,
+        "__restore_retain" => op_restore_retain,
+        "__restore_release" => op_restore_release,
+        "__facet_restore_mint" => op_facet_restore_mint,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -8169,6 +8173,20 @@ struct FacetStart {
     parent: storage::StorageIdentity,
 }
 
+/// The published root that runs each live facet, keyed by the facet's scope.
+///
+/// A facet has no route of its own, so a facet that mints a persistent stub
+/// asks its root (an ordinary cell route) to store the row. The facet never
+/// learns the parent handle; it carries it from the call that entered it.
+static FACET_ROOTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn facet_roots() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    FACET_ROOTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("facet roots poisoned")
+}
+
 /// A facet ready for one call, with what its reply must wait for.
 struct LoadedFacet {
     slot: Arc<crate::pool::Slot>,
@@ -8511,6 +8529,7 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
         &start.owner,
         &start.name,
     );
+    facet_roots().insert(scope.clone(), start.parent.root_scope.clone());
     let opening = slot
         .turn(|worker| {
             if let Some(pending) = &pending {
@@ -8558,6 +8577,15 @@ fn op_facet_rpc(
     };
     let method = args.get(7).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(8)).unwrap_or_default();
+    // The parent persistent-stub handle, when the caller reached this facet
+    // through a stub minted by `ctx.restore`. The facet event carries it so
+    // the facet can mint its own persistent stub through the same chain.
+    let parent_handle = args.get(9).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let method = if parent_handle == 0 {
+        method
+    } else {
+        format!("__celldParent:{parent_handle}:{method}")
+    };
     let parent = match storage::storage_identity(&parent_scope) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
@@ -9266,8 +9294,12 @@ fn enqueue_stub_rpc(
     args_bytes: bytes::Bytes,
 ) -> u64 {
     // A persistent handle has no live entry in the owner's table: its
-    // operations replay `[restore]` from the durable row instead.
-    let prefix = if claims.flags & FLAG_RESTORE != 0 {
+    // operations replay `[restore]` from the durable row instead. A facet
+    // handle replays through the facet the row's spec names, because the
+    // facet itself has no published route.
+    let prefix = if claims.flags & FLAG_FACET_RESTORE != 0 {
+        "__celldFacetRestoreOp:"
+    } else if claims.flags & FLAG_RESTORE != 0 {
         "__celldRestoreOp:"
     } else {
         "__celldStubOp:"
@@ -9499,13 +9531,18 @@ fn op_restore_mint(
         Ok(handle) => handle,
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
+    let facet = args.get(1).boolean_value(scope);
     let claims = CapabilityClaims {
         kind: CapabilityKind::Cell,
         owner: owner.clone(),
         node: String::new(),
         generation: 0,
         handle,
-        flags: FLAG_RESTORE,
+        flags: if facet {
+            FLAG_RESTORE | FLAG_FACET_RESTORE
+        } else {
+            FLAG_RESTORE
+        },
     };
     match capability_key().mint(&claims) {
         Ok(token) => {
@@ -9550,6 +9587,109 @@ fn op_restore_forget(
     if let Err(error) = storage::restore_forget(&owner, handle) {
         loader_throw(scope, &error.to_string());
     }
+}
+
+/// `__restore_retain(handle)` -> new reference count.
+///
+/// A facet-owned chain names its parent by handle, not by token, so the child
+/// needs a way to keep the parent's row alive. This is the same exported
+/// reference the parent's own token owns.
+fn op_restore_retain(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let handle = args.get(0).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let Some(owner) = restore_owner(scope) else {
+        return loader_throw_typed(scope, "forbidden", "restore refs need a cell event");
+    };
+    let count = capability_refs().lock().unwrap().retain(&owner, handle);
+    rv.set(v8::Integer::new(scope, count as i32).into());
+}
+
+/// `__restore_release(handle)` -> whether this was the last reference.
+fn op_restore_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let handle = args.get(0).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let Some(owner) = restore_owner(scope) else {
+        return loader_throw_typed(scope, "forbidden", "restore refs need a cell event");
+    };
+    let last = capability_refs().lock().unwrap().release(&owner, handle);
+    if last == Some(true) {
+        if let Err(error) = storage::restore_forget(&owner, handle) {
+            return loader_throw(scope, &error.to_string());
+        }
+    }
+    rv.set(v8::Boolean::new(scope, last == Some(true)).into());
+}
+
+/// `__facet_restore_mint(argsSc)` -> Promise<Uint8Array token bytes>.
+///
+/// The facet cannot write the root's database itself (it may run in another
+/// isolate, and the write would miss the root's output gate). It asks the root
+/// cell to mint: the root is a published route, and its event owns the durable
+/// row and the gate that proves it. The args carry the parent persistent
+/// handle through which the call entered the facet; the root stores that
+/// chain, so a restart re-resolves the facet through `[restore]` instead of a
+/// loader id that no longer exists.
+fn op_facet_restore_mint(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(args_sc) = view_bytes(args.get(0)) else {
+        return loader_throw_typed(scope, "forbidden", "ctx.restore params are not bytes");
+    };
+    let Some(owner) = restore_owner(scope) else {
+        return loader_throw_typed(
+            scope,
+            "forbidden",
+            "a facet persistent stub needs a facet event",
+        );
+    };
+    let root = facet_roots().get(&owner).cloned();
+    let Some(root) = root else {
+        return loader_throw_typed(
+            scope,
+            "forbidden",
+            "ctx.restore in a facet requires a live facet",
+        );
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = RpcCallReq {
+        scope: root,
+        name: None,
+        method: "__celldMintFacetRestore".to_owned(),
+        args: RpcData::V8(args_sc.into()),
+        reply: tx,
+    };
+    let id = asyncrt::enqueue(async move {
+        if let Err(error) = gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
+        {
+            return Err(rpc_error("transport", error));
+        }
+        match rx.await {
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+            Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
+                "transport",
+                "the root answered JSON to a facet restore mint",
+            )),
+            Ok(Err(error)) => {
+                let message = format!("{error}");
+                let code = classify_owner_error(&message);
+                Err(rpc_error(code, message))
+            }
+            Err(error) => Err(rpc_error(
+                "transport",
+                format!("RPC proxy dropped: {error}"),
+            )),
+        }
+    });
+    rv.set(promise_for(scope, id));
 }
 
 /// `__rpc_call(scope, name, method, argsSc)` -> Promise<Uint8Array>;

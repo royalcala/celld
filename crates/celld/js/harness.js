@@ -2138,6 +2138,10 @@ const __makeLoopbackDurableObjectClass = (name) => {
 // a remote method. A persistent stub returned by `[restore]` may be one, so
 // the resolver recognises them instead of applying own-property visibility.
 const __facetStubs = new WeakSet();
+// Raw transport for a facet stub a persistent restore produced: the token
+// caller expects envelope bytes, so replaying through the app-facing pipeline
+// (which decodes) would lose them. Keyed by the facet stub object.
+const __facetInvokers = new WeakMap();
 class DurableObjectFacets {
   constructor(state) {
     this._state = state;
@@ -2204,7 +2208,8 @@ class DurableObjectFacets {
             "Pipelined property paths on facets are not supported yet.");
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          propsSc, path[0], __rpcOut(args, false)));
+          propsSc, path[0], __rpcOut(args, false),
+          __currentRestoreParent() ?? 0));
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -2241,6 +2246,15 @@ class DurableObjectFacets {
       },
     });
     __facetStubs.add(record.stub);
+    // The persistent-stub chain invokes this facet with raw envelope bytes;
+    // the app-facing pipeline above would decode and re-encode them.
+    __facetInvokers.set(record.stub,
+      async (method, argsSc, parentHandle) => {
+        const [loader, className, id, propsSc] = await start();
+        return await __facet_rpc(
+          loader, className, this._state._scope, record.owner, name, id,
+          propsSc, method, argsSc, parentHandle);
+      });
     this._running.set(name, record);
     return record.stub;
   }
@@ -2877,7 +2891,31 @@ class DurableObjectState {
   // A persistent stub: the params are stored in this cell's reserved table
   // and the returned capability replays `[restore](params)` in the owner on
   // first use. It survives eviction because the row is part of the cell.
+  //
+  // A facet cannot own that row: its scope is a hash with no published route,
+  // and the root may live in another isolate. So the facet asks its root to
+  // mint, carrying the parent handle through which it was entered. That round
+  // trip makes the facet form return a Promise; the DO form stays synchronous.
   restore(params) {
+    if (__cell.facetConfigs[this._scope] !== undefined) {
+      // Workerd's rule: a facet may only mint a persistent stub through a
+      // stub its parent created with ctx.restore(). That parent handle is
+      // what lets a later replay reopen this facet without a loader id.
+      const parent = __currentRestoreParent();
+      if (parent === undefined)
+        throw new TypeError(
+          "ctx.restore in a facet requires a stub created by ctx.restore().");
+      let argsSc;
+      try {
+        argsSc = __rpcOut({ parent, params }, false);
+      } catch (error) {
+        throw new TypeError(
+          "ctx.restore params must be structured-cloneable without live stubs.",
+          { cause: error });
+      }
+      return __facet_restore_mint(argsSc).then((bytes) =>
+        __foreignStub(__rpcDes(bytes), undefined, true));
+    }
     let paramsSc;
     try {
       paramsSc = __rpcOut(params, false);
@@ -2886,7 +2924,7 @@ class DurableObjectState {
         "ctx.restore params must be structured-cloneable without live stubs.",
         { cause: error });
     }
-    return __foreignStub(__restore_mint(paramsSc), undefined, true);
+    return __foreignStub(__restore_mint(paramsSc, false), undefined, true);
   }
 }
 function _instance(scope) {
@@ -3830,6 +3868,26 @@ const __ctxKey = Symbol("celld.ctx");
 const __ctxNow = () => {
   const frame = __als_get();
   return frame === undefined ? undefined : frame.get(__ctxKey);
+};
+// The persistent-stub handle through which this event entered a facet, if
+// any. A facet may only mint its own persistent stub through that chain:
+// the chain is what tells a later replay how to reopen the facet.
+const __restoreParentKey = Symbol("celld.restoreParent");
+const __currentRestoreParent = () => {
+  const frame = __als_get();
+  return frame === undefined ? undefined : frame.get(__restoreParentKey);
+};
+const __withRestoreParent = (parent, fn) => {
+  if (parent === undefined || parent === 0) return fn();
+  const prior = __als_get();
+  const frame = new Map(prior);
+  frame.set(__restoreParentKey, parent);
+  __als_set(frame);
+  try {
+    return fn();
+  } finally {
+    __als_set(prior);
+  }
 };
 // The instance a context belongs to, for `ctx.restore()` in an entrypoint or
 // Durable Object. Set when the instance is constructed.
@@ -5275,6 +5333,10 @@ const __rpcDesArgs = (bytes) => {
   const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
   return { args: revived.value, received: revived.handles };
 };
+// A missing argument list reaches the owner as zero bytes (the cell transport
+// has no typed "none"), which is never a valid clone envelope.
+const __rpcNoArgs = (args) =>
+  args === null || args === undefined || args.byteLength === 0;
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own
 // properties, `.remote`, and a local (caller-side) stack.
@@ -5652,7 +5714,7 @@ const __dispatchStubOp = async (handle, path, argsBytes) => {
     __disposeStub({ entry, disposed: false, ctx: __ctxNow() });
     return __rpcOut(null, true);
   }
-  const decoded = argsBytes === null ? null : __rpcDesArgs(argsBytes);
+  const decoded = __rpcNoArgs(argsBytes) ? null : __rpcDesArgs(argsBytes);
   try {
     return await __ctxRun(entry.ctx, async () => __rpcRun(
       () => __rpcWalk(entry.target, path,
@@ -5720,15 +5782,107 @@ const __dispatchRestoreOp = async (handle, path, argsBytes) => {
   const entry = await __restoreEntry(handle);
   if (entry === undefined)
     throw __rpcDisposedError();
-  const decoded = argsBytes === null ? null : __rpcDesArgs(argsBytes);
+  const decoded = __rpcNoArgs(argsBytes) ? null : __rpcDesArgs(argsBytes);
+  try {
+    // A target minted by `[restore]` may be a facet. Its calls carry this
+    // handle as their chain, so the facet can mint its own persistent stub
+    // and a replay can find the facet through the same route.
+    return await __withRestoreParent(handle, () =>
+      __ctxRun(entry.ctx, async () => __rpcRun(
+        () => __rpcWalk(entry.target, path,
+          decoded === null ? null : decoded.args, false), true)));
+  } finally {
+    if (decoded !== null)
+      for (const received of decoded.received) __disposeStub(received);
+  }
+};
+// ---- facet-owned persistent stubs -------------------------------
+// The root's row stores `{parent, params}`. On every operation the root
+// replays the parent handle to reach the facet, then asks the facet to replay
+// `[restore]`; the facet caches the resulting target for its residency.
+const __facetRestores = new Map();
+const __facetRestorePending = new Map();
+const __facetRestoreEntry = async (handle, params) => {
+  const cached = __facetRestores.get(handle);
+  if (cached !== undefined) return cached;
+  let pending = __facetRestorePending.get(handle);
+  if (pending === undefined) {
+    pending = (async () => {
+      const scope = __currentActorScope();
+      const inst = await _readyInstance(scope);
+      const restoreFn = inst[__cf.restore];
+      if (typeof restoreFn !== "function")
+        throw new TypeError(
+          "This Durable Object does not implement [restore].");
+      const target = await restoreFn.call(inst, params);
+      const entry = { target, ctx: __ctxNow() };
+      __facetRestores.set(handle, entry);
+      return entry;
+    })();
+    __facetRestorePending.set(handle, pending);
+    const clear = () => {
+      if (__facetRestorePending.get(handle) === pending)
+        __facetRestorePending.delete(handle);
+    };
+    pending.then(clear, clear);
+  }
+  return await pending;
+};
+// The facet half of one operation: replay `[restore]`, then walk the path.
+const __dispatchFacetRestore = async (args) => {
+  const request = __rpcDes(args);
+  if (request.dispose) {
+    const entry = __facetRestores.get(request.handle);
+    __facetRestores.delete(request.handle);
+    if (entry !== undefined) {
+      const disposer = entry.target?.[Symbol.dispose];
+      if (typeof disposer === "function")
+        Promise.resolve().then(() => disposer.call(entry.target));
+    }
+    return __rpcOut(null, true);
+  }
+  const entry = await __facetRestoreEntry(request.handle, request.params);
+  const decoded = __rpcNoArgs(request.args) ? null : __rpcDesArgs(request.args);
   try {
     return await __ctxRun(entry.ctx, async () => __rpcRun(
-      () => __rpcWalk(entry.target, path,
+      () => __rpcWalk(entry.target, request.path,
         decoded === null ? null : decoded.args, false), true));
   } finally {
     if (decoded !== null)
       for (const received of decoded.received) __disposeStub(received);
   }
+};
+// The root half: replay the parent handle to reach the facet, then forward
+// one operation through the raw facet transport. The parent is re-minted by
+// its own `[restore]`, so no loader id or class is persisted.
+const __dispatchFacetRestoreOp = async (handle, path, argsBytes) => {
+  const chainBytes = __restore_params(handle);
+  if (chainBytes === null) throw __rpcDisposedError();
+  const { parent, params } = __rpcDes(chainBytes);
+  const parentEntry = await __restoreEntry(parent);
+  if (parentEntry === undefined) throw __rpcDisposedError();
+  const invoker = __facetInvokers.get(parentEntry.target);
+  if (invoker === undefined) throw __rpcDisposedError();
+  const request = path === null
+    ? { handle, params, dispose: true }
+    : { handle, params, path,
+        args: __rpcNoArgs(argsBytes) ? null : argsBytes };
+  const reply = await invoker(
+    "__celldFacetRestore", __rpcOut(request, false), parent);
+  if (path === null) {
+    __facetRestores.delete(handle);
+    try { __restore_forget(handle); } catch {}
+    // The chain owned one reference to the parent; give it back. The parent
+    // row (and its cached target) goes away only with its last reference.
+    try {
+      if (__restore_release(parent)) {
+        __restoreEntries.delete(parent);
+        __restorePending.delete(parent);
+      }
+    } catch {}
+    return __rpcOut(null, true);
+  }
+  return reply;
 };
 // The stateless-owner entrypoint: a WorkerJob::StubRpc event in the isolate
 // that exported the target calls this with the path still as JSON.
@@ -5747,7 +5901,22 @@ __celld.__dispatchStubRpc = async (id, pathJson, args) => {
 // on use anywhere else. Callee exceptions cross in
 // the error envelope on every flavor.
 __celld.__dispatchRpc = async (scope, method, args) => {
+  // A facet call made through a persistent-stub chain names that chain. The
+  // facet may only mint its own persistent stub while this is set.
+  let parentHandle = 0;
+  if (method.startsWith("__celldParent:")) {
+    const rest = method.slice("__celldParent:".length);
+    const separator = rest.indexOf(":");
+    parentHandle = Number(rest.slice(0, separator));
+    method = rest.slice(separator + 1);
+  }
   const actorEvent = __beginActorEvent(scope);
+  const priorFrame = __als_get();
+  if (parentHandle !== 0) {
+    const frame = new Map(priorFrame);
+    frame.set(__restoreParentKey, parentHandle);
+    __als_set(frame);
+  }
   try {
     if (method.startsWith("__celldStubOp:")) {
       const rest = method.slice("__celldStubOp:".length);
@@ -5769,6 +5938,52 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       const path = pathJson === "null" ? null : JSON.parse(pathJson);
       try {
         return await __dispatchRestoreOp(handle, path, args);
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
+    }
+    // A facet asks its root to store a persistent stub. The row records the
+    // parent persistent handle, so a replay reaches the facet through
+    // `[restore]` (which re-resolves loaded workers) instead of a stale id.
+    if (method === "__celldMintFacetRestore") {
+      try {
+        const { parent, params } = __rpcDes(args);
+        if (!Number.isSafeInteger(parent) || parent <= 0)
+          throw __rpcCodedError("RpcForbiddenError", "forbidden",
+            "a facet restore must name the parent persistent stub");
+        if (__restore_params(parent) === null)
+          throw __rpcDisposedError();
+        const argsSc = __rpcOut({ parent, params }, false);
+        // The child keeps the parent's row alive even after the caller drops
+        // the stub it used to enter the facet.
+        __restore_retain(parent);
+        try {
+          return __rpcOut(__restore_mint(argsSc, true), true);
+        } catch (error) {
+          __restore_release(parent);
+          throw error;
+        }
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
+    }
+    if (method.startsWith("__celldFacetRestoreOp:")) {
+      const rest = method.slice("__celldFacetRestoreOp:".length);
+      const separator = rest.indexOf(":");
+      const handle = Number(rest.slice(0, separator));
+      const pathJson = rest.slice(separator + 1);
+      const path = pathJson === "null" ? null : JSON.parse(pathJson);
+      try {
+        return await __dispatchFacetRestoreOp(handle, path, args);
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
+    }
+    // Internal: the root asks this facet to replay `[restore]` for one
+    // persistent handle and run the operation.
+    if (method === "__celldFacetRestore") {
+      try {
+        return await __dispatchFacetRestore(args);
       } catch (error) {
         return __rpcErrOut(error);
       }
@@ -5798,6 +6013,7 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       }
     })());
   } finally {
+    if (parentHandle !== 0) __als_set(priorFrame);
     __endActorEvent(actorEvent);
   }
 };

@@ -30,6 +30,10 @@ pub const FLAG_CALLABLE: u8 = 0b01;
 /// Bit 1 names a handle that is a row of the owner's persistent-stub table, so
 /// an operation on it replays `[restore]` instead of looking up a live target.
 pub const FLAG_RESTORE: u8 = 0b10;
+/// Bit 2 narrows a restore handle to a facet: the owner replays `[restore]`
+/// through the facet that the row's spec names, because a facet has no
+/// published route of its own.
+pub const FLAG_FACET_RESTORE: u8 = 0b100;
 /// Domain separation for the capability key derived from a fleet secret.
 const KEY_DOMAIN: &[u8] = b"celld-capability-key-v1";
 /// Domain separation for the token MAC.
@@ -613,6 +617,11 @@ mod tests {
         // handle must not be mistaken for one (that collision dispatched
         // ordinary method stubs into the `[restore]` replay path).
         assert_eq!(FLAG_CALLABLE & FLAG_RESTORE, 0);
+        assert_eq!(
+            FLAG_FACET_RESTORE & (FLAG_CALLABLE | FLAG_RESTORE),
+            0,
+            "the facet marker sits beside, not on, the other flags"
+        );
         let mut restored = claims();
         restored.handle = 12;
         restored.flags = FLAG_RESTORE;
