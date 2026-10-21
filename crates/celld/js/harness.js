@@ -3875,6 +3875,13 @@ const __ctxUnregister = (meta) => {
   set.delete(meta);
   if (set.size === 0) __ctxStubs.delete(meta.ctx);
 };
+// Foreign capabilities are not local entries: their lifetime is the exported
+// reference count, not a handle in this isolate. The finalizer releases the
+// reference if application code drops the stub without disposing it.
+const __remoteStubMeta = new WeakMap();
+const __remoteStubFinalizer = new FinalizationRegistry((token) => {
+  try { __cap_release(token); } catch {}
+});
 // Tear down a context: dispose every handle it still holds, so a
 // dup() leaked into it reaches the sender's disposal callback.
 const __ctxEnd = (id) => {
@@ -4219,6 +4226,18 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
         (typeof v !== "object" && typeof v !== "function")) return v;
     const cached = seen.get(v);
     if (cached !== undefined) return cached;
+    const remote = __remoteStubMeta.get(v);
+    if (remote !== undefined) {
+      if (!allowCapabilities) return v;
+      if (remote.disposed) throw __stubDisposedError();
+      lifted = true;
+      caps = true;
+      // The sender keeps its reference; the receiver gets a new one.
+      __cap_retain(remote.token);
+      const marker = { "__celld$cap": remote.token };
+      seen.set(v, marker);
+      return marker;
+    }
     const meta = __stubMeta.get(v);
     if (meta) {
       if (!allowCapabilities) return v;
@@ -4345,7 +4364,14 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const out = Array.isArray(v) ? [] : {};
     seen.set(v, out);
-    for (const key of Object.keys(v)) out[key] = lift(v[key]);
+    for (const key of Object.keys(v)) {
+      // Wire markers are host-issued. Application data may not forge one by
+      // naming a field; a capability only crosses via an authenticated token.
+      if (key.startsWith("__celld$"))
+        throw new DOMException(
+          "Reserved RPC marker in application data.", "DataCloneError");
+      out[key] = lift(v[key]);
+    }
     const disposerSource = originals?.get(v) ?? v;
     const disposer = disposerSource[Symbol.dispose];
     if (allowCapabilities && !Array.isArray(v) &&
@@ -4474,17 +4500,6 @@ const __stubRevive = (value) => {
     if (v === null || typeof v !== "object") return v;
     const capToken = v["__celld$cap"];
     if (capToken !== undefined) return __foreignStub(capToken);
-    const stubId = v["__celld$stub"];
-    if (stubId !== undefined) {
-      const entry = v.t === __stubIsolate
-        ? __stubEntries.get(stubId) : undefined;
-      const stub = entry === undefined
-        ? __foreignStub()
-        : __makeStub(entry, v.c);
-      const meta = __stubMeta.get(stub);
-      if (meta) handles.push(meta);
-      return stub;
-    }
     const svcName = v["__celld$svc"];
     if (svcName !== undefined)
       return v.t === __stubIsolate
@@ -4537,7 +4552,10 @@ const __stubRevive = (value) => {
 // A capability token minted by another isolate. Every operation round-trips
 // through the host, which verifies the token and routes it as a native DO RPC
 // call; the caller never learns the scope or the entry id.
-const __foreignStub = (token) => {
+const __rpcBrokenMessage = (error) =>
+  /no longer available|RPC proxy dropped|no RPC channel|Durable Object.*not found|owner.*gone/i
+    .test(String(error?.message ?? error));
+const __foreignStub = (token, state) => {
   if (token === undefined) {
     return new Proxy(function () {}, {
       get: (_b, prop) => {
@@ -4549,32 +4567,55 @@ const __foreignStub = (token) => {
         "RPC stubs cannot cross isolate boundaries yet.")),
     });
   }
-  let disposed = false;
+  state ??= { broken: false, error: undefined, callbacks: [] };
+  const meta = { token, disposed: false, state };
+  const track = (promise) => promise.catch((error) => {
+    if (!state.broken && __rpcBrokenMessage(error)) {
+      state.broken = true;
+      state.error = error;
+      for (const callback of state.callbacks.splice(0)) {
+        try { callback(error); } catch {}
+      }
+    }
+    throw error;
+  });
   const session = {
-    get: (path) => __stub_rpc_call_token(
-      token, JSON.stringify(path), null).then((bytes) => __rpcDes(bytes)),
-    call: (path, args) => __stub_rpc_call_token(
+    get: (path) => track(__stub_rpc_call_token(
+      token, JSON.stringify(path), null).then((bytes) => __rpcDes(bytes))),
+    call: (path, args) => track(__stub_rpc_call_token(
       token, JSON.stringify(path), __rpcOut(args, true),
-    ).then((bytes) => __rpcDes(bytes)),
+    ).then((bytes) => __rpcDes(bytes))),
   };
-  return new Proxy(function () {}, {
+  const stub = new Proxy(function () {}, {
     getPrototypeOf: () => __cf.RpcStub.prototype,
     get: (_b, prop) => {
       if (prop === "then") return undefined;
       if (prop === Symbol.dispose) return () => {
-        if (disposed) return;
-        disposed = true;
-        __stub_rpc_call_token(token, "null", null).catch(() => {});
+        if (meta.disposed) return;
+        meta.disposed = true;
+        __remoteStubFinalizer.unregister(meta);
+        try { __cap_release(token); } catch {}
       };
-      if (prop === "dup") return () => __foreignStub(token);
+      if (prop === "dup") return () => {
+        if (meta.disposed) throw __stubDisposedError();
+        __cap_retain(token);
+        return __foreignStub(token, state);
+      };
+      if (prop === "onRpcBroken") return (callback) => {
+        if (state.broken) callback(state.error);
+        else state.callbacks.push(callback);
+      };
       if (typeof prop !== "string") return undefined;
       return __makeNode(session, [prop], __ctxNow());
     },
     apply: (_b, _this, args) => __makeNode(
-      __valueSession(__stub_rpc_call_token(
+      __valueSession(track(__stub_rpc_call_token(
         token, "[]", __rpcOut(args, true),
-      ).then((bytes) => __rpcDes(bytes))), [], __ctxNow()),
+      ).then((bytes) => __rpcDes(bytes)))), [], __ctxNow()),
   });
+  __remoteStubMeta.set(stub, meta);
+  __remoteStubFinalizer.register(stub, token, meta);
+  return stub;
 };
 // Workerd's entrypoint method-visibility rules (worker-rpc.c++):
 // reserved lifecycle names are refused outright; only prototype
@@ -5467,14 +5508,20 @@ const __dispatchStubOp = async (handle, path, argsBytes) => {
     __disposeStub({ entry, disposed: false, ctx: __ctxNow() });
     return __rpcOut(null, true);
   }
-  const decoded = __rpcDesArgs(argsBytes);
+  const decoded = argsBytes === null ? null : __rpcDesArgs(argsBytes);
   try {
     return await __ctxRun(entry.ctx, async () => __rpcRun(
-      () => __rpcWalk(entry.target, path, decoded.args, false), true));
+      () => __rpcWalk(entry.target, path,
+        decoded === null ? null : decoded.args, false), true));
   } finally {
-    for (const received of decoded.received) __disposeStub(received);
+    if (decoded !== null)
+      for (const received of decoded.received) __disposeStub(received);
   }
 };
+// The stateless-owner entrypoint: a WorkerJob::StubRpc event in the isolate
+// that exported the target calls this with the path still as JSON.
+__celld.__dispatchStubRpc = async (id, pathJson, args) =>
+  await __dispatchStubOp(id, JSON.parse(pathJson), args);
 // The byte path always lifts stub-able values into the reply: the
 // markers carry the isolate token, so they revive only back in this
 // isolate (same-process routed dispatch re-enters it) and fail loudly

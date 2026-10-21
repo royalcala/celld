@@ -410,6 +410,53 @@ impl CapabilityRegistry {
     }
 }
 
+/// Reference counts for capabilities exported across isolates. Keyed by the
+/// owner and handle rather than by token: every token for the same capability
+/// shares one count, and only the last release asks the owner to dispose it.
+#[derive(Debug, Default)]
+pub struct CapabilityRefs {
+    entries: HashMap<(String, u64), u32>,
+}
+
+impl CapabilityRefs {
+    /// Add one reference and return the new count.
+    pub fn retain(&mut self, owner: &str, handle: u64) -> u32 {
+        let count = self.entries.entry((owner.to_owned(), handle)).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Drop one reference. Returns `Some(true)` when the last reference was
+    /// dropped, `Some(false)` while references remain, and `None` when the
+    /// capability was never registered or was already released.
+    pub fn release(&mut self, owner: &str, handle: u64) -> Option<bool> {
+        let key = (owner.to_owned(), handle);
+        let count = self.entries.get_mut(&key)?;
+        if *count > 1 {
+            *count -= 1;
+            Some(false)
+        } else {
+            self.entries.remove(&key);
+            Some(true)
+        }
+    }
+
+    /// The current reference count, if any.
+    pub fn count(&self, owner: &str, handle: u64) -> Option<u32> {
+        self.entries.get(&(owner.to_owned(), handle)).copied()
+    }
+
+    /// Number of tracked capabilities.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no capabilities are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +579,21 @@ mod tests {
             registry.register(claims(), 1),
             Err(CapabilityError::DuplicateHandle)
         );
+    }
+
+    #[test]
+    fn exported_refs_are_shared_by_owner_and_handle() {
+        let mut refs = CapabilityRefs::default();
+        assert_eq!(refs.retain("scope-a", 3), 1);
+        assert_eq!(refs.retain("scope-a", 3), 2);
+        assert_eq!(refs.retain("scope-b", 3), 1);
+        assert_eq!(refs.count("scope-a", 3), Some(2));
+        assert_eq!(refs.release("scope-a", 3), Some(false));
+        assert_eq!(refs.release("scope-a", 3), Some(true));
+        assert_eq!(refs.count("scope-a", 3), None);
+        assert_eq!(refs.release("scope-a", 3), None);
+        assert_eq!(refs.count("scope-b", 3), Some(1));
+        assert_eq!(refs.len(), 1);
+        assert!(!refs.is_empty());
     }
 }

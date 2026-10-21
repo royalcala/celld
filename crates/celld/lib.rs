@@ -265,6 +265,14 @@ pub enum WorkerJob {
         batch: js::QueueBatch,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::QueueDispatchResult>>,
     },
+    /// An operation on a capability that a stateless isolate exported. The
+    /// target lives in that isolate's heap, so the event runs there.
+    StubRpc {
+        id: u64,
+        path: Option<Vec<String>>,
+        args: Option<Vec<u8>>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
 }
 
 /// Temporary host seam required by the verbatim JS adapter. The runtime

@@ -14,7 +14,7 @@
 //! async in JS, synchronous underneath — the ops are sync Rust, wrapped in
 //! `async` by the JS harness.
 use crate::asyncrt;
-use crate::capability::{CapabilityClaims, CapabilityKey, CapabilityKind};
+use crate::capability::{CapabilityClaims, CapabilityKey, CapabilityKind, CapabilityRefs};
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
@@ -4200,7 +4200,7 @@ impl Worker {
             | crate::WorkerJob::Rpc {
                 invocation_limits, ..
             } => *invocation_limits,
-            crate::WorkerJob::Queue { .. } => None,
+            crate::WorkerJob::Queue { .. } | crate::WorkerJob::StubRpc { .. } => None,
         };
         let initial_limits =
             effective_resource_limits(inner.runtime_state.resource_limits, invocation_limits);
@@ -4539,6 +4539,14 @@ fn begin<'s>(
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
+        crate::WorkerJob::StubRpc {
+            id,
+            path,
+            args,
+            reply,
+        } => {
+            return begin_stub_rpc(tc, id, path, args, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -4656,6 +4664,83 @@ fn begin<'s>(
 /// promise, and let `drive` pump it with no isolate held across the awaits.
 /// The old dispatcher blocked until the promise settled, which is why RPC
 /// needed a thread of its own and why `WorkerPool` outlived the fetch path.
+/// Start an operation on a capability that this stateless isolate exported.
+/// `__dispatchStubRpc` runs it under the request context that exported it.
+fn begin_stub_rpc(
+    tc: &mut v8::PinScope,
+    id: u64,
+    path: Option<Vec<String>>,
+    args: Option<Vec<u8>>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::with_resource_limits(effective_resource_limits(
+        actor_runtime_state(tc).resource_limits,
+        None,
+    ));
+    let guard = CurrentGuard::enter(context.clone());
+    context.begin_cpu_turn();
+    let started = (|| {
+        let f = internal_function(tc, "__dispatchStubRpc")?;
+        let path = v8::String::new(tc, &serde_json::to_string(&path)?).unwrap();
+        let args = match args {
+            Some(args) => bytes_value(tc, args),
+            None => v8::null(tc).into(),
+        };
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(
+                tc,
+                recv,
+                &[v8::Number::new(tc, id as f64).into(), path.into(), args],
+            )
+            .ok_or_else(|| anyhow!("dispatchStubRpc threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    let event_started = Instant::now();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+                tail_report: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let cpu_error = context.finish_cpu_turn().err().map(anyhow::Error::msg);
+            let error = take_execution_termination(tc)
+                .or(cpu_error)
+                .unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
 fn begin_entrypoint_rpc(
     tc: &mut v8::PinScope,
     entrypoint: &str,
@@ -6825,6 +6910,8 @@ ops! { OP_NAMES, install_op_functions,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
         "__cap_mint" => op_cap_mint,
+        "__cap_retain" => op_cap_retain,
+        "__cap_release" => op_cap_release,
         "__stub_rpc_call_token" => op_stub_rpc_call_token,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
@@ -8966,6 +9053,31 @@ fn capability_key() -> &'static CapabilityKey {
     })
 }
 
+/// Process-local exported reference counts, keyed by owner and handle.
+fn capability_refs() -> &'static Mutex<CapabilityRefs> {
+    static REFS: OnceLock<Mutex<CapabilityRefs>> = OnceLock::new();
+    REFS.get_or_init(|| Mutex::new(CapabilityRefs::default()))
+}
+
+/// Stateless isolates that exported a capability, by host heap id. Weak, so a
+/// marker cannot keep a retired isolate alive; a call to one that is gone
+/// fails instead.
+static STUB_OWNER_SLOTS: OnceLock<
+    Mutex<std::collections::HashMap<String, Weak<crate::pool::Slot>>>,
+> = OnceLock::new();
+
+fn register_stub_owner_slot(heap: &str, slot: &Arc<crate::pool::Slot>) {
+    let mut slots = STUB_OWNER_SLOTS.get_or_init(Mutex::default).lock().unwrap();
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    slots.insert(heap.to_owned(), Arc::downgrade(slot));
+}
+
+fn stub_owner_slot(heap: &str) -> Option<Arc<crate::pool::Slot>> {
+    STUB_OWNER_SLOTS
+        .get()
+        .and_then(|slots| slots.lock().unwrap().get(heap).and_then(Weak::upgrade))
+}
+
 /// `__cap_mint(kind, owner, handle, flags)` -> opaque capability token.
 fn op_cap_mint(
     scope: &mut v8::PinScope,
@@ -9000,7 +9112,9 @@ fn op_cap_mint(
         },
         2 => match crate::pool::current_slot() {
             Some(slot) if owner.is_empty() => {
-                (CapabilityKind::Stateless, slot.heap_id().to_string())
+                let heap = slot.heap_id().to_string();
+                register_stub_owner_slot(&heap, &slot);
+                (CapabilityKind::Stateless, heap)
             }
             Some(_) => {
                 loader_throw(scope, "stateless capability owner is host-derived");
@@ -9026,10 +9140,141 @@ fn op_cap_mint(
     };
     match capability_key().mint(&claims) {
         Ok(token) => {
+            capability_refs()
+                .lock()
+                .unwrap()
+                .retain(&claims.owner, claims.handle);
             let token = v8::String::new(scope, &token).unwrap();
             rv.set(token.into());
         }
         Err(error) => loader_throw(scope, &error.to_string()),
+    }
+}
+
+/// Enqueues one capability operation through the native Durable Object RPC
+/// path. The cell's `__dispatchRpc` recognises the `__celldStubOp:` prefix.
+fn enqueue_stub_rpc(
+    scope: &mut v8::PinScope,
+    claims: &CapabilityClaims,
+    path: &str,
+    args_bytes: bytes::Bytes,
+) -> u64 {
+    let method = format!("__celldStubOp:{}:{}", claims.handle, path);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = RpcCallReq {
+        scope: claims.owner.clone(),
+        name: None,
+        method,
+        args: RpcData::V8(args_bytes),
+        reply: tx,
+    };
+    asyncrt::enqueue(async move {
+        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
+        match rx.await {
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+            Ok(Ok(RpcData::Json(_))) => {
+                Err("RPC answered JSON to a structured-clone stub call".into())
+            }
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("RPC proxy dropped: {e}")),
+        }
+    })
+}
+
+/// Enqueues one capability operation on the stateless isolate that owns it.
+fn enqueue_stub_rpc_stateless(
+    scope: &mut v8::PinScope,
+    claims: &CapabilityClaims,
+    path: Option<Vec<String>>,
+    args: Option<Vec<u8>>,
+) -> u64 {
+    let owner = claims.owner.clone();
+    let handle = claims.handle;
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    asyncrt::enqueue(async move {
+        let gone = || "RPC target's isolate is gone, or is on another celld node.".to_string();
+        await_egress_gate(gate)
+            .await
+            .map_err(|error| error.to_string())?;
+        let slot = stub_owner_slot(&owner).ok_or_else(gone)?;
+        // Affiliate before checking, so the pool cannot free the isolate
+        // between the check and the drive; held until the call is done.
+        let _hold = slot.affiliate();
+        if slot.is_retiring() {
+            return Err(gone());
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::StubRpc {
+            id: handle,
+            path,
+            args,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("stub RPC task died: {error}")),
+                Ok(()) => Err("stub RPC owner dropped its result".to_string()),
+            },
+        }
+    })
+}
+
+/// `__cap_retain(token)` -> new reference count.
+fn op_cap_retain(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    let claims = match capability_key().verify(&token) {
+        Ok(claims) => claims,
+        Err(error) => {
+            loader_throw(scope, &error.to_string());
+            return;
+        }
+    };
+    let count = capability_refs()
+        .lock()
+        .unwrap()
+        .retain(&claims.owner, claims.handle);
+    rv.set(v8::Integer::new(scope, count as i32).into());
+}
+
+/// `__cap_release(token)`: drop one exported reference. The final release
+/// disposes the owner entry.
+fn op_cap_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    let claims = match capability_key().verify(&token) {
+        Ok(claims) => claims,
+        Err(error) => {
+            loader_throw(scope, &error.to_string());
+            return;
+        }
+    };
+    let last = capability_refs()
+        .lock()
+        .unwrap()
+        .release(&claims.owner, claims.handle);
+    if last == Some(true) {
+        match claims.kind {
+            CapabilityKind::Cell => {
+                // Fire-and-forget: the owner entry's dispose does not need a
+                // reply.
+                let _ = enqueue_stub_rpc(scope, &claims, "null", bytes::Bytes::new());
+            }
+            CapabilityKind::Stateless => {
+                let _ = enqueue_stub_rpc_stateless(scope, &claims, None, None);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -9052,9 +9297,9 @@ fn op_stub_rpc_call_token(
     };
     let args_value = args.get(2);
     let args_bytes = if args_value.is_null_or_undefined() {
-        bytes::Bytes::new()
+        None
     } else {
-        bytes::Bytes::copy_from_slice(&view_bytes(args_value).unwrap_or_default())
+        Some(view_bytes(args_value).unwrap_or_default())
     };
     let claims = match capability_key().verify(&token) {
         Ok(claims) => claims,
@@ -9063,36 +9308,29 @@ fn op_stub_rpc_call_token(
             return;
         }
     };
-    if claims.kind != CapabilityKind::Cell {
-        loader_throw(
+    match claims.kind {
+        CapabilityKind::Cell => {
+            let id = enqueue_stub_rpc(
+                scope,
+                &claims,
+                &path,
+                bytes::Bytes::copy_from_slice(args_bytes.as_deref().unwrap_or_default()),
+            );
+            rv.set(promise_for(scope, id));
+        }
+        CapabilityKind::Stateless => {
+            let Ok(path) = serde_json::from_str::<Option<Vec<String>>>(&path) else {
+                loader_throw(scope, "capability path is not valid JSON");
+                return;
+            };
+            let id = enqueue_stub_rpc_stateless(scope, &claims, path, args_bytes);
+            rv.set(promise_for(scope, id));
+        }
+        _ => loader_throw(
             scope,
             "this capability kind cannot cross isolate boundaries yet",
-        );
-        return;
+        ),
     }
-    let method = format!("__celldStubOp:{}:{}", claims.handle, path);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
-    let request = RpcCallReq {
-        scope: claims.owner,
-        name: None,
-        method,
-        args: RpcData::V8(args_bytes),
-        reply: tx,
-    };
-    let id = asyncrt::enqueue(async move {
-        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
-        match rx.await {
-            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
-            Ok(Ok(RpcData::Json(_))) => {
-                Err("RPC answered JSON to a structured-clone stub call".into())
-            }
-            Ok(Err(e)) => Err(format!("{e}")),
-            Err(e) => Err(format!("RPC proxy dropped: {e}")),
-        }
-    });
-    let promise = promise_for(scope, id);
-    rv.set(promise);
 }
 
 /// `__rpc_call(scope, name, method, argsSc)` -> Promise<Uint8Array>;
