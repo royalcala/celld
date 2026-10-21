@@ -260,6 +260,25 @@ impl CapabilityKey {
 
     /// Verifies a token and returns its authenticated claims.
     pub fn verify(&self, token: &str) -> Result<CapabilityClaims, CapabilityError> {
+        let payload = self.verified_payload(token)?;
+        parse_claims(&payload)
+    }
+
+    /// Verifies a token across a rolling upgrade. Version 1 tokens predate the
+    /// owner node, incarnation and facet route, so they are only safe for
+    /// durable handles: a transient handle needs the node/incarnation fence.
+    /// Returns `(claims, legacy)`.
+    pub fn verify_compat(&self, token: &str) -> Result<(CapabilityClaims, bool), CapabilityError> {
+        let payload = self.verified_payload(token)?;
+        match payload.first().copied() {
+            Some(TOKEN_VERSION) => parse_claims(&payload).map(|claims| (claims, false)),
+            Some(1) => parse_claims_v1(&payload).map(|claims| (claims, true)),
+            Some(version) => Err(CapabilityError::UnknownVersion(version)),
+            None => Err(CapabilityError::Malformed),
+        }
+    }
+
+    fn verified_payload(&self, token: &str) -> Result<Vec<u8>, CapabilityError> {
         if token.len() > MAX_TOKEN_LEN {
             return Err(CapabilityError::TokenTooLong);
         }
@@ -277,8 +296,14 @@ impl CapabilityKey {
         verifier
             .verify_slice(mac)
             .map_err(|_| CapabilityError::BadMac)?;
-        parse_claims(payload)
+        Ok(payload.to_vec())
     }
+}
+
+/// A version 1 token has no node, incarnation or route, so only a durable
+/// handle (whose owner row is re-resolved by scope) may use it.
+pub fn legacy_is_safe(legacy: bool, flags: u8) -> bool {
+    !legacy || flags & FLAG_RESTORE != 0
 }
 
 fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> {
@@ -331,6 +356,31 @@ fn parse_claims(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
         kind,
         owner,
         route,
+        node,
+        generation,
+        handle,
+        flags,
+    })
+}
+
+fn parse_claims_v1(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
+    let mut cursor = 0_usize;
+    if take_u8(payload, &mut cursor)? != 1 {
+        return Err(CapabilityError::Malformed);
+    }
+    let kind = CapabilityKind::from_u8(take_u8(payload, &mut cursor)?)?;
+    let flags = take_u8(payload, &mut cursor)?;
+    let generation = take_u64(payload, &mut cursor)?;
+    let handle = take_u64(payload, &mut cursor)?;
+    let owner = take_string(payload, &mut cursor, MAX_OWNER_LEN)?;
+    let node = take_string(payload, &mut cursor, MAX_NODE_LEN)?;
+    if cursor != payload.len() {
+        return Err(CapabilityError::Malformed);
+    }
+    Ok(CapabilityClaims {
+        kind,
+        owner,
+        route: String::new(),
         node,
         generation,
         handle,
@@ -567,6 +617,45 @@ mod tests {
         let token = key().mint(&claims()).expect("mint");
         let other = CapabilityKey::new([8_u8; 32]);
         assert_eq!(other.verify(&token), Err(CapabilityError::BadMac));
+    }
+
+    fn v1_payload(claims: &CapabilityClaims) -> Vec<u8> {
+        let owner = claims.owner.as_bytes();
+        let node = claims.node.as_bytes();
+        let mut payload = Vec::new();
+        payload.push(1);
+        payload.push(claims.kind.as_u8());
+        payload.push(claims.flags);
+        payload.extend_from_slice(&claims.generation.to_le_bytes());
+        payload.extend_from_slice(&claims.handle.to_le_bytes());
+        payload.extend_from_slice(&(owner.len() as u16).to_le_bytes());
+        payload.extend_from_slice(owner);
+        payload.extend_from_slice(&(node.len() as u16).to_le_bytes());
+        payload.extend_from_slice(node);
+        payload
+    }
+
+    #[test]
+    fn legacy_tokens_are_durable_only() {
+        let key = key();
+        let mut durable = claims();
+        durable.flags = FLAG_RESTORE;
+        let token = key.sign_payload(&v1_payload(&durable)).expect("sign");
+        assert_eq!(key.verify(&token), Err(CapabilityError::UnknownVersion(1)));
+        let (parsed, legacy) = key.verify_compat(&token).expect("compat");
+        assert!(legacy);
+        assert_eq!(parsed.route, String::new());
+        assert!(legacy_is_safe(legacy, parsed.flags));
+
+        let mut transient = claims();
+        transient.flags = 0;
+        let token = key.sign_payload(&v1_payload(&transient)).expect("sign");
+        let (parsed, legacy) = key.verify_compat(&token).expect("compat");
+        assert!(!legacy_is_safe(legacy, parsed.flags));
+
+        let token = key.mint(&claims()).expect("mint");
+        let (_, legacy) = key.verify_compat(&token).expect("compat");
+        assert!(!legacy);
     }
 
     #[test]

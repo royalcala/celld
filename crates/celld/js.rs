@@ -9451,13 +9451,21 @@ fn op_cap_check(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let token = args.get(0).to_rust_string_lossy(scope);
-    let claims = match capability_key().verify(&token) {
+    let (claims, legacy) = match capability_key().verify_compat(&token) {
         Ok(claims) => claims,
         Err(error) => {
             loader_throw_typed(scope, "forbidden", &error.to_string());
             return;
         }
     };
+    if !crate::capability::legacy_is_safe(legacy, claims.flags) {
+        loader_throw_typed(
+            scope,
+            "forbidden",
+            "legacy transient capability has no cross-node fence; drain the old node and re-acquire",
+        );
+        return;
+    }
     let context = event_context(scope);
     let Some(frame) = current_cell_event(&context) else {
         loader_throw_typed(scope, "forbidden", "capability used outside a cell event");
@@ -9629,7 +9637,7 @@ fn op_cap_retain(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let token = args.get(0).to_rust_string_lossy(scope);
-    let claims = match capability_key().verify(&token) {
+    let (claims, _legacy) = match capability_key().verify_compat(&token) {
         Ok(claims) => claims,
         Err(error) => {
             loader_throw(scope, &error.to_string());
@@ -9651,7 +9659,7 @@ fn op_cap_release(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let token = args.get(0).to_rust_string_lossy(scope);
-    let claims = match capability_key().verify(&token) {
+    let (claims, _legacy) = match capability_key().verify_compat(&token) {
         Ok(claims) => claims,
         Err(error) => {
             loader_throw(scope, &error.to_string());
@@ -9700,13 +9708,21 @@ fn op_stub_rpc_call_token(
     } else {
         Some(view_bytes(args_value).unwrap_or_default())
     };
-    let claims = match capability_key().verify(&token) {
+    let (claims, legacy) = match capability_key().verify_compat(&token) {
         Ok(claims) => claims,
         Err(error) => {
             loader_throw_typed(scope, "forbidden", &error.to_string());
             return;
         }
     };
+    if !crate::capability::legacy_is_safe(legacy, claims.flags) {
+        loader_throw_typed(
+            scope,
+            "forbidden",
+            "legacy transient capability has no cross-node fence; drain the old node and re-acquire",
+        );
+        return;
+    }
     match claims.kind {
         CapabilityKind::Cell => {
             let id = enqueue_stub_rpc(

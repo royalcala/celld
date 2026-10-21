@@ -41,6 +41,7 @@ export class Cell extends DurableObject {
     const value = await this.ctx.storage.get("durable");
     return value ? await value.value() : "missing";
   }
+  async makeCallback() { return new PingTarget(); }
   async callback(target) {
     try { return await target.ping(); }
     catch (error) { return `err:${error?.code ?? error?.name ?? error}`; }
@@ -68,6 +69,11 @@ export default {
     if (url.pathname === "/store") return new Response(await cell.storeDurable());
     if (url.pathname === "/durable") return new Response(await cell.durable());
     if (url.pathname === "/stateless") return new Response(await cell.callback(new PingTarget()));
+    if (url.pathname === "/legacy-cell") {
+      const callback = await cell.makeCallback();
+      try { return new Response(await callback.ping()); }
+      catch (error) { return new Response(`err:${error?.code ?? error?.name ?? error}`); }
+    }
     return new Response("ok");
   },
 };

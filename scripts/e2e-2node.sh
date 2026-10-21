@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 BIN=${CELLD_BIN:-target/debug/celld}
 ENDPOINT=${S3_ENDPOINT:?set S3_ENDPOINT}
 BUCKET=${S3_BUCKET:-celld-fleet}
+LOCAL_ROOT=${S3_LOCAL_ROOT:-}
 APORT=${A_PORT:-18202}; BPORT=${B_PORT:-18203}
 AINT=${A_INTERNAL:-19202}; BINT=${B_INTERNAL:-19203}
 TTL_MS=${CELLD_TTL_MS:-4000}
@@ -16,6 +17,28 @@ export CELLD_TTL_MS=$TTL_MS
 
 log() { printf '%s\n' "== $*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+owner_record() {
+  [ -n "$LOCAL_ROOT" ] || return 1
+  local f
+  f=$(find "$LOCAL_ROOT/$BUCKET/cells" -path '*Cell:*' -name own.json 2>/dev/null | head -1)
+  [ -n "$f" ] || return 1
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["node"])' "$f" 2>/dev/null
+}
+wait_owner() { # node timeout-seconds
+  local deadline=$(( $(date +%s) + ${2:-30} ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(owner_record || true)" = "$1" ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+assert_owner_stable() { # expected, attempts
+  for _ in $(seq 1 "${2:-20}"); do
+    local o; o=$(owner_record || true)
+    [ "$o" = "$1" ] || fail "owner moved/duplicated: want $1 saw ${o:-none}"
+    sleep 0.25
+  done
+}
 wait_for() { # url expected
   for _ in $(seq 1 120); do
     body=$(curl -s --max-time 2 "$1" || true)
@@ -43,13 +66,24 @@ start_b() {
 cleanup() { kill -9 "${A_PID:-}" "${B_PID:-}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-start_a; start_b
-log "wait for readiness"
+log "start node A first so it owns the cell"
+start_a
 wait_for "http://127.0.0.1:$APORT/hello" "hello-from-cell" || { tail -20 /tmp/fleet-a.log; fail "node A not ready"; }
+[ -n "$LOCAL_ROOT" ] || fail "set S3_LOCAL_ROOT (fixture bucket data dir) for the strict owner assertion"
+wait_owner node-a 30 || fail "node-a did not own the cell: $(owner_record || echo none)"
+
+log "start node B"
+start_b
 wait_for "http://127.0.0.1:$BPORT/hello" "hello-from-cell" || { tail -20 /tmp/fleet-b.log; fail "node B not ready"; }
 
 log "cross-node capability"
 [ "$(curl -s "http://127.0.0.1:$BPORT/hello")" = "hello-from-cell" ] || fail "cross-node hello"
+
+log "single owner: bucket ownership record"
+[ -n "$LOCAL_ROOT" ] || fail "set S3_LOCAL_ROOT (fixture bucket data dir) for the strict owner assertion"
+wait_owner node-a 30 || fail "node-a did not own the cell: $(owner_record || echo none)"
+OWNER_INITIAL=$(owner_record)
+log "owner=$OWNER_INITIAL"
 
 log "cross-node stream (BYOB)"
 [ "$(curl -s "http://127.0.0.1:$BPORT/stream")" = "cross-node-stream" ] || fail "cross-node stream"
@@ -72,10 +106,17 @@ kill -9 "$A_PID"; wait "$A_PID" 2>/dev/null || true
 sleep $((TTL_MS / 1000 + 6))
 [ "$(curl -s --max-time 20 "http://127.0.0.1:$BPORT/durable")" = "durable-value" ] || fail "durable takeover"
 [ "$(curl -s "http://127.0.0.1:$BPORT/hello")" = "hello-from-cell" ] || fail "hello after takeover"
+wait_owner node-b 30 || fail "node-b did not take over the cell: $(owner_record || echo none)"
+OWNER_TAKEOVER=$(owner_record)
+log "owner after takeover=$OWNER_TAKEOVER"
 
 log "restart node A: the cell stays with one owner"
 start_a
 wait_for "http://127.0.0.1:$APORT/hello" "hello-from-cell" || fail "node A not ready after restart"
 [ "$(curl -s "http://127.0.0.1:$APORT/hello")" = "hello-from-cell" ] || fail "hello via restarted A"
+[ "$(curl -s "http://127.0.0.1:$BPORT/hello")" = "hello-from-cell" ] || fail "hello via B after A restart"
+[ "$(owner_record)" = "$OWNER_TAKEOVER" ] || fail "owner changed across restart: before=$OWNER_TAKEOVER after=$(owner_record)"
+assert_owner_stable "$OWNER_TAKEOVER" 20
+log "single owner after restart=$OWNER_TAKEOVER"
 
 log "PASS 2-node matrix"

@@ -59,3 +59,9 @@ A fleet can place the named cells on different nodes, and each cell keeps an
 independent counter.
 
 They are examples, not the complete compatibility test suite.
+
+- [`fleet-fixture`](./fleet-fixture): two-node fleet fixture used by `scripts/e2e-2node.sh` and the mixed-version rolling-deploy test.
+
+- `fleet-fixture/` — the two-node runtime matrix: cross-node capability,
+  BYOB stream, durable restore, stateless rejection, cancellation, hard-kill
+  takeover and restart.  Run it with `scripts/e2e-2node.sh`.

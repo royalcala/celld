@@ -91,5 +91,6 @@ jobs:
             sleep 0.25
           done
           S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=celld-fleet \
+            S3_LOCAL_ROOT=/tmp/s3s-data \
             CELLD_BIN=target/debug/celld CELLD_ESBUILD="$(command -v esbuild)" \
             bash scripts/e2e-2node.sh
