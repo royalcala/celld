@@ -84,3 +84,76 @@ SIGKILLed in the first moments after enabling an alarm can lose that wake
 entry, and no successor has a record to fire.  Allow the alarm to ship (a few
 seconds) before hard-killing the owner; graceful shutdown drains it.  The
 2-node app hook test waits five seconds after `enableHook` for this reason.
+
+## Encrypted secrets
+
+- The config lists **names and kinds only**:
+  `"secrets": {"API_TOKEN": "text", "TLS_KEY": "key"}`.
+- Values never come from the config. Pass them at deploy time:
+  `--secret API_TOKEN=@token.txt` (or `--secret-file API_TOKEN=token.txt`;
+  `@-` reads one value from stdin). Literal values are refused, and the deploy
+  output/`--json`/errors never echo a value.
+- `CELLD_SECRET_KEY` (32 bytes, 64 hex) must be in the deploy and node
+  environments. It is never written to the bucket, the manifest or a log.
+  Values are AES-256-GCM encrypted with an AAD binding script + name + kind.
+- The manifest carries names/kinds and the ciphertext SHA-256, never a value;
+  the version changes with the ciphertext, so rotating a value is a new
+  deployment generation. The node decrypts once at load, injects
+  `secret_text`/`secret_key` bindings, and registers the values with the log
+  redactor.
+- Missing/wrong key: the node rejects that deployment with a clear, redacted
+  error and the previous generation keeps serving (a node with no previous
+  generation does not serve it).
+- `secrets-v1` is a required deployment feature. **Upgrade every node to a C
+  build before the first secrets deploy**: a binary that predates the
+  required-features check cannot be forced to refuse and may serve missing
+  bindings. The `e2e-secrets.sh` pre-C probe is informational for that reason.
+- Rotation: deploy a new value (new version); nodes adopt it. Master-key
+  rotation: redeploy each secret with the new `CELLD_SECRET_KEY` (values come
+  from the secret manager, never from the bucket).
+
+## Observability
+
+- Every fetch gets `x-celld-request-id` (client-supplied or generated) and
+  echoes it on the response; it is in the event ALS, the `tracing` span
+  records and the console-line prefix. RPC/DO fetch dispatch opens the same
+  request frame.
+- `cloudflare:workers` exports `tracing` (`enterSpan`, `getActiveSpan`,
+  `Span.setAttribute(s)`, `Span.end`, `isTraced`). Spans are bounded host
+  records (`span_begin`/`span_end`) with a parent, request id, redacted
+  attributes and duration. A secret used as an attribute appears as
+  `[redacted]`.
+- Metrics are low-cardinality: RPC calls/errors/latency by transport/code,
+  typed host errors, HTTP requests, stream reads/writes/cancels, trace spans,
+  ownership wake takeovers. `curl http://127.0.0.1:<internal>/metrics` on the
+  operator listener. No bodies, headers, tokens or secrets.
+- Console lines are redacted and capped (8 KiB).
+
+## Final C checklist
+
+Local/CI (any S3 endpoint; `tools/s3gw` is the reference):
+
+```sh
+cargo +1.98.1 fmt --all -- --check
+cargo +1.98.1 clippy --workspace --all-targets -- -D warnings
+cargo +1.98.1 test --workspace
+
+S3_ENDPOINT=... S3_BUCKET=... S3_LOCAL_ROOT=... \
+  bash scripts/e2e-2node.sh
+S3_ENDPOINT=... S3_BUCKET=... S3_LOCAL_ROOT=... PREB_BIN=... \
+  bash scripts/e2e-mixed-version.sh
+S3_ENDPOINT=... S3_BUCKET=... S3_LOCAL_ROOT=... \
+  CELLD_ESBUILD="$(command -v esbuild)" bash scripts/e2e-secrets.sh
+```
+
+Checks:
+
+- `tools/s3gw/scripts/accept.sh` (celld diagnose: conditional create/update)
+  and `race.sh` (exactly one winner per concurrent `If-None-Match` round).
+- Ownership record: one `own.json` node per cell; before kill A -> A, after
+  takeover -> B, after A restarts -> B (no steal). Calls through A and B work.
+- No plaintext secret in the deploy output, bucket object tree or node logs;
+  the span log shows the secret attribute redacted.
+- The app-level celld-os tests (manager diff): cross-node + typed
+  `owner-moved`, and the scheduler hook firing after a hard node kill with no
+  double fire after restart.
