@@ -24,6 +24,21 @@ is upgraded.  The compat path deliberately does not accept transient legacy
 tokens, because they carry no node or isolate incarnation and could alias a
 reused handle.
 
+## Local / CI bucket endpoint
+
+Use `tools/s3gw` (vendored, `us-s3gw`). It is the small `s3s`-based store with
+the conditional check+write serialized under one CAS lock, which is what the
+ownership fence needs: `scripts/accept.sh` runs `celld diagnose` and
+`scripts/race.sh` asserts exactly one winner per concurrent `If-None-Match`
+round. It also hashes metadata filenames, so celld's long facet-log keys fit
+`NAME_MAX` (the reason s3s-fs crops up as `File name too long` here). Build it
+from `tools/s3gw`; the fleet scripts take any S3 endpoint (`S3_ENDPOINT`,
+`S3_BUCKET`, and `S3_LOCAL_ROOT` for the ownership record). Garage accepts
+`If-Match` without enforcing it; MinIO community artifacts are no longer
+downloadable. `S3_LOCAL_ROOT` is only used for the local filesystem layout
+(s3gw/s3s-fs); with a network store read the ownership record through the S3
+API instead.
+
 ## Procedure
 
 1. `celld diagnose --bucket … --endpoint …` on every bucket endpoint; the

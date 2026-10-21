@@ -1,0 +1,47 @@
+[Unit]
+Description=us-s3gw — atomic-CAS S3 gateway for the celld fleet bucket
+Documentation=https://github.com/royalcala/us-s3gw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=us-s3gw
+Group=us-s3gw
+
+# Config + credentials live outside the repo (mode 0600).
+EnvironmentFile=/etc/us-s3gw/us-s3gw.env
+ExecStart=/usr/local/bin/us-s3gw \
+    --host ${S3GW_HOST} \
+    --port ${S3GW_PORT} \
+    --access-key ${S3GW_ACCESS_KEY} \
+    --secret-key ${S3GW_SECRET_KEY} \
+    ${S3GW_ROOT}
+
+# Durability: come back after a crash and after a reboot (enable it, see deploy/README.md).
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# One writer per root: never start two instances against the same S3GW_ROOT.
+# (The CAS lock is process-wide; a second instance reintroduces the race.)
+LimitNOFILE=65536
+
+# Sandbox. ProtectSystem=strict makes the whole tree read-only except the data
+# dir; if S3GW_ROOT changes, update ReadWritePaths to match.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/us-s3gw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Local S3 endpoint for the fleet tests; kept as its own crate/lockfile so its
+# s3s dependency graph does not enter the runtime workspace.
+exclude = ["tools/s3gw"]
 
 # Size-tuned: fat LTO prunes unused dependency code, panic=abort drops
 # unwind tables. opt-level "s" (not "z") — measure RPS before trading further.

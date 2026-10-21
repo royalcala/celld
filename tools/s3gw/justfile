@@ -1,0 +1,36 @@
+# us-s3gw — build + verification recipes. See README.md for what each gate means.
+
+default: ci
+
+# Release binary.
+build:
+    cargo build --release
+
+# Formatting gate.
+fmt:
+    cargo fmt --check
+
+# Lint gate (deny warnings).
+lint:
+    cargo clippy --all-targets -- -D warnings
+
+# Acceptance: `celld diagnose` must say `ok bucket conditional write`.
+# Fails otherwise. Override the binary with CELLD_BIN=/path/to/celld.
+accept:
+    ./scripts/accept.sh
+
+# Concurrency: 24 x `If-None-Match: *` PUT -> exactly 1 winner per round (5 rounds).
+race:
+    ./scripts/race.sh
+
+# Multipart vs single-PUT measurements at the sizes celld stores (512K..64M).
+bulk:
+    ./scripts/bulk.sh
+
+# Live measurement: a real celld node against us-s3gw; must produce a >=5 MiB
+# L1 object served through multipart (requires celld + esbuild on PATH).
+live:
+    ./scripts/live-sizes.sh
+
+# Full CI gate: fmt + clippy + build + acceptance + concurrency.
+ci: fmt lint build accept race

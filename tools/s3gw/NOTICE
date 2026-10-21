@@ -1,0 +1,21 @@
+us-s3gw
+Copyright 2026 the us-s3gw authors
+
+This product includes software developed as part of the s3s project
+(https://github.com/s3s-project/s3s), licensed under the Apache License,
+Version 2.0.
+
+Derived from: s3s-fs 0.14.1
+
+Changes from that original (2026-09-27):
+  - Renamed the package to us-s3gw (library `us_s3gw`).
+  - Added a process-wide CAS lock (`cas_lock` in src/fs.rs), held across the
+    precondition check and the write in `put_object` and
+    `complete_multipart_upload` (src/s3.rs), so an S3 conditional write
+    (`If-Match` / `If-None-Match`) is atomic. Upstream performed the check and
+    the write with no lock, so concurrent conditional PUTs could both succeed.
+  - Added the `US_S3GW_NO_CAS_LOCK` diagnostic switch (src/lib.rs), which only
+    exists so the concurrency test can demonstrate the failure the lock prevents.
+  - Added README.md.
+
+The original licence text is kept in LICENSE.s3s-fs.

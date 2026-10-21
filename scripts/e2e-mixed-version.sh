@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Mixed-version fleet: node A runs the pre-B build (token v1), node B the
 # current build (token v2). Exercises the bounded rolling-upgrade window.
+# Recommended local/CI endpoint: tools/s3gw (CAS-serialized conditional
+# writes, hashed metadata filenames). PREB_BIN is a binary built at the
+# pre-B commit; the script prints the observed compatibility errors.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

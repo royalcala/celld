@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Two-node runtime E2E. Requires an S3-compatible endpoint (MinIO or s3s-fs).
+# Recommended local/CI endpoint: tools/s3gw (CAS-serialized conditional
+# writes, hashed metadata filenames). Any S3 endpoint works; S3_LOCAL_ROOT is
+# the filesystem root used to read the ownership record (s3gw/s3s-fs layout).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=us-s3gw backup — mirror + point-in-time snapshot
+Documentation=https://github.com/royalcala/us-s3gw
+# Do not run while the store is being installed/upgraded.
+After=us-s3gw.service
+Wants=us-s3gw.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/us-s3gw/us-s3gw.env
+# user scope: the script stops/starts the user unit when S3GW_QUIESCE=1
+Environment=S3GW_SYSTEMD_SCOPE=user
+ExecStart=%h/.local/bin/us-s3gw-backup
+Nice=10
+IOSchedulingClass=idle

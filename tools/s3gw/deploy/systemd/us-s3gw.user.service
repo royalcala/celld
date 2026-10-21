@@ -1,0 +1,33 @@
+[Unit]
+Description=us-s3gw — atomic-CAS S3 gateway for the celld fleet bucket (user service)
+Documentation=https://github.com/royalcala/us-s3gw
+
+[Service]
+Type=simple
+
+# Config + credentials live outside the repo (mode 0600); S3GW_ROOT default below,
+# the env file overrides any of these.
+Environment=S3GW_HOST=127.0.0.1
+Environment=S3GW_PORT=9020
+Environment=S3GW_ROOT=%h/us-s3gw-data
+EnvironmentFile=-%h/.config/us-s3gw/us-s3gw.env
+ExecStart=%h/.local/bin/us-s3gw \
+    --host ${S3GW_HOST} \
+    --port ${S3GW_PORT} \
+    --access-key ${S3GW_ACCESS_KEY} \
+    --secret-key ${S3GW_SECRET_KEY} \
+    ${S3GW_ROOT}
+
+# Durability: come back after a crash and after a reboot (with lingering enabled).
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# One writer per root: never start two instances against the same S3GW_ROOT.
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

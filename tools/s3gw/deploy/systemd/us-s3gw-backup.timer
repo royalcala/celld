@@ -1,0 +1,14 @@
+[Unit]
+Description=us-s3gw backup timer (mirror + snapshot)
+Documentation=https://github.com/royalcala/us-s3gw
+
+[Timer]
+# S3GW_QUIESCE=1 in the env file costs a short stop/start; keep it at a quiet hour.
+OnCalendar=*-*-* 03:30:00
+AccuracySec=1m
+RandomizedDelaySec=5m
+Persistent=true
+Unit=us-s3gw-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -53,9 +53,11 @@ jobs:
     name: Two-node fleet (S3)
     runs-on: ubuntu-22.04
     timeout-minutes: 45
-    # An S3-compatible endpoint backed by the filesystem. MinIO's current
-    # community artifacts are gated; s3s-fs implements the conditional-write
-    # surface the bucket probe requires and drives the same code path as MinIO.
+    # The vendored us-s3gw (tools/s3gw) is the local S3-compatible endpoint:
+    # same s3s code path as MinIO, conditional writes serialized by a single
+    # CAS lock, and metadata filenames hashed so celld's long facet-log keys
+    # stay under NAME_MAX. Its acceptance script runs celld diagnose and a
+    # concurrent If-None-Match race before the fleet matrix.
     steps:
       - uses: actions/checkout@v6
 
@@ -70,27 +72,40 @@ jobs:
         with:
           key: ci-two-node-${{ env.RUST_VERSION }}
 
-      - name: Build celld
-        run: cargo build --bin celld
-
-      - name: Install esbuild and the S3 endpoint
+      - name: Build celld and the S3 gateway
         run: |
           set -euo pipefail
-          npm install --global esbuild
-          cargo install s3s-fs --version 0.17.0
+          cargo build --bin celld
+          cargo build --release --manifest-path tools/s3gw/Cargo.toml
+          cargo fmt --manifest-path tools/s3gw/Cargo.toml -- --check
+
+      - name: Install esbuild
+        run: npm install --global esbuild
+
+      - name: S3 gateway acceptance (conditional writes + CAS race)
+        env:
+          CELLD_BIN: ${{ github.workspace }}/target/debug/celld
+          S3GW_BIN: ${{ github.workspace }}/tools/s3gw/target/release/us-s3gw
+          S3GW_PORT: "9020"
+        run: |
+          set -euo pipefail
+          bash tools/s3gw/scripts/accept.sh
+          bash tools/s3gw/scripts/race.sh
 
       - name: Two-node matrix
+        env:
+          S3GW_BIN: ${{ github.workspace }}/tools/s3gw/target/release/us-s3gw
         run: |
           set -euo pipefail
-          mkdir -p /tmp/s3s-data/celld-fleet
-          s3s-fs /tmp/s3s-data --host 127.0.0.1 --port 9000 \
-            --access-key minioadmin --secret-key minioadmin &
+          mkdir -p /tmp/s3gw-data/celld-fleet
+          "$S3GW_BIN" --host 127.0.0.1 --port 9000 \
+            --access-key minioadmin --secret-key minioadmin /tmp/s3gw-data &
           for _ in $(seq 1 80); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
             [ -n "$code" ] && [ "$code" != "000" ] && break
             sleep 0.25
           done
           S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=celld-fleet \
-            S3_LOCAL_ROOT=/tmp/s3s-data \
+            S3_LOCAL_ROOT=/tmp/s3gw-data \
             CELLD_BIN=target/debug/celld CELLD_ESBUILD="$(command -v esbuild)" \
             bash scripts/e2e-2node.sh

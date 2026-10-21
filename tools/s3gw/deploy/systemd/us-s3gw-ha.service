@@ -1,0 +1,42 @@
+# us-s3gw HA instance (T87, real hardware) — dedicated disk + replicated root.
+#
+# On the NixOS servers this runs as a *runtime* unit (/run/systemd/system, since
+# /etc/systemd/system is NixOS-static) installed by deploy/ha_remote.sh's
+# `install` step. For persistence across reboots, declare the equivalent in the
+# NixOS configuration (see the runbook §7.8, `systemd.services.us-s3gw-ha` plus
+# `fileSystems` for /srv/us-s3gw*). This file is the single source of truth for
+# the unit body; the installer copies it verbatim.
+[Unit]
+Description=us-s3gw HA — fleet store (dedicated btrfs disk, replicated)
+After=network-online.target
+Wants=network-online.target
+# The data subvolume must be mounted (declarative equivalent: fileSystems entry).
+RequiresMountsFor=/srv/us-s3gw
+
+[Service]
+Type=simple
+User=us-s3gw
+Group=us-s3gw
+# Config + credentials live outside the repo, mode 0600.
+EnvironmentFile=/etc/us-s3gw-ha/us-s3gw-ha.env
+ExecStart=/usr/local/bin/us-s3gw \
+    --host ${S3GW_HOST} \
+    --port ${S3GW_PORT} \
+    --access-key ${S3GW_ACCESS_KEY} \
+    --secret-key ${S3GW_SECRET_KEY} \
+    ${S3GW_ROOT}
+
+# One writer per root: never start this on two nodes at once (the CAS is a
+# process lock; two gateways = two locks = two cell owners).
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/us-s3gw
+
+[Install]
+WantedBy=multi-user.target
