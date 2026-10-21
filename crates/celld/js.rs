@@ -678,10 +678,11 @@ impl CellJob {
         }
     }
 
-    /// The client request that can cancel this event, when it is a fetch.
+    /// The caller request that can cancel this event: a fetch's client, or a
+    /// capability/native RPC whose caller can abandon the call.
     pub(crate) fn request_id(&self) -> Option<RequestId> {
         match self {
-            CellJob::Fetch { request_id, .. } => *request_id,
+            CellJob::Fetch { request_id, .. } | CellJob::Rpc { request_id, .. } => *request_id,
             _ => None,
         }
     }
@@ -1389,6 +1390,39 @@ static CANCELLED_REQUESTS: OnceLock<Mutex<HashSet<RequestId>>> = OnceLock::new()
 
 fn cancelled_requests() -> &'static Mutex<HashSet<RequestId>> {
     CANCELLED_REQUESTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Names one outbound cell RPC and publishes its abort if the caller's host
+/// op is dropped before the call settles.
+///
+/// The caller's context teardown (`ctx.abort`, a client disconnect) drops the
+/// op future without running any continuation, so the drop itself is the only
+/// signal that the callee is no longer wanted. `runtime.rpc` drives the cell
+/// event under the same id and samples the flag between turns.
+struct RpcCallCancel(Option<RequestId>);
+
+impl RpcCallCancel {
+    fn new() -> Self {
+        Self(Some(next_request_id()))
+    }
+
+    fn id(&self) -> Option<RequestId> {
+        self.0
+    }
+
+    /// The caller has its answer (or a failure); a later drop must not cancel
+    /// a different event.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RpcCallCancel {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            abort_request(id);
+        }
+    }
 }
 
 fn promise_store(scope: &mut v8::PinScope, id: u64, r: v8::Global<v8::PromiseResolver>) {
@@ -5914,7 +5948,10 @@ fn start_fetch<'s>(
         FetchTarget::Default(fetch) => {
             let env = harness_env(tc)?;
             let execution_ctx = begin_event_context(tc)?;
-            fetch.call(tc, recv, &[req, env, execution_ctx])
+            // Through the harness so the handler runs in its request frame
+            // (`__ctxRun`): `ctx.abort()` and host-op tracking key off it.
+            let call = internal_function(tc, "__callDefaultFetch")?;
+            call.call(tc, recv, &[fetch.into(), req, env, execution_ctx])
         }
     };
     let Some(ret) = ret else {
@@ -9307,34 +9344,44 @@ fn enqueue_stub_rpc(
     let method = format!("{prefix}{}:{}", claims.handle, path);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: claims.owner.clone(),
         name: None,
         method,
         args: RpcData::V8(args_bytes),
+        request_id: cancel.id(),
         reply: tx,
     };
     asyncrt::enqueue(async move {
-        if let Err(error) = gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
-        {
-            return Err(rpc_error("transport", error));
-        }
-        match rx.await {
-            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
-            Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
-                "transport",
-                "RPC answered JSON to a structured-clone stub call",
-            )),
-            Ok(Err(error)) => {
-                let message = format!("{error}");
-                let code = classify_owner_error(&message);
-                Err(rpc_error(code, message))
+        let answer = async {
+            if let Err(error) =
+                gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
+            {
+                return Err(rpc_error("transport", error));
             }
-            Err(error) => Err(rpc_error(
-                "transport",
-                format!("RPC proxy dropped: {error}"),
-            )),
-        }
+            match rx.await {
+                Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+                Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
+                    "transport",
+                    "RPC answered JSON to a structured-clone stub call",
+                )),
+                Ok(Err(error)) => {
+                    let message = format!("{error}");
+                    let code = classify_owner_error(&message);
+                    Err(rpc_error(code, message))
+                }
+                Err(error) => Err(rpc_error(
+                    "transport",
+                    format!("RPC proxy dropped: {error}"),
+                )),
+            }
+        };
+        let answer = answer.await;
+        // The op future being dropped (caller teardown) is what publishes the
+        // abort; reaching here means the caller has an answer either way.
+        cancel.disarm();
+        answer
     })
 }
 
@@ -9660,34 +9707,42 @@ fn op_facet_restore_mint(
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: root,
         name: None,
         method: "__celldMintFacetRestore".to_owned(),
         args: RpcData::V8(args_sc.into()),
+        request_id: cancel.id(),
         reply: tx,
     };
     let id = asyncrt::enqueue(async move {
-        if let Err(error) = gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
-        {
-            return Err(rpc_error("transport", error));
-        }
-        match rx.await {
-            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
-            Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
-                "transport",
-                "the root answered JSON to a facet restore mint",
-            )),
-            Ok(Err(error)) => {
-                let message = format!("{error}");
-                let code = classify_owner_error(&message);
-                Err(rpc_error(code, message))
+        let answer = async {
+            if let Err(error) =
+                gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await
+            {
+                return Err(rpc_error("transport", error));
             }
-            Err(error) => Err(rpc_error(
-                "transport",
-                format!("RPC proxy dropped: {error}"),
-            )),
+            match rx.await {
+                Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+                Ok(Ok(RpcData::Json(_))) => Err(rpc_error(
+                    "transport",
+                    "the root answered JSON to a facet restore mint",
+                )),
+                Ok(Err(error)) => {
+                    let message = format!("{error}");
+                    let code = classify_owner_error(&message);
+                    Err(rpc_error(code, message))
+                }
+                Err(error) => Err(rpc_error(
+                    "transport",
+                    format!("RPC proxy dropped: {error}"),
+                )),
+            }
         }
+        .await;
+        cancel.disarm();
+        answer
     });
     rv.set(promise_for(scope, id));
 }
@@ -9706,21 +9761,30 @@ fn op_rpc_call(
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let mut cancel = RpcCallCancel::new();
     let request = RpcCallReq {
         scope: cell,
         name,
         method,
         args,
+        request_id: cancel.id(),
         reply: tx,
     };
     let id = asyncrt::enqueue(async move {
-        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
-        match rx.await {
-            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
-            Ok(Ok(RpcData::Json(_))) => Err("RPC answered JSON to a structured-clone call".into()),
-            Ok(Err(e)) => Err(format!("{e}")),
-            Err(e) => Err(format!("RPC proxy dropped: {e}")),
+        let answer = async {
+            gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
+            match rx.await {
+                Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+                Ok(Ok(RpcData::Json(_))) => {
+                    Err("RPC answered JSON to a structured-clone call".into())
+                }
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(e) => Err(format!("RPC proxy dropped: {e}")),
+            }
         }
+        .await;
+        cancel.disarm();
+        answer
     });
     let p = promise_for(scope, id);
     rv.set(p);
@@ -13462,5 +13526,61 @@ mod rpc_error_tests {
             "owner-gone"
         );
         assert_eq!(classify_owner_error("cell overloaded"), "overloaded");
+    }
+}
+
+#[cfg(test)]
+mod rpc_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn an_abandoned_call_publishes_its_abort_once() {
+        let id;
+        {
+            let cancel = RpcCallCancel::new();
+            id = cancel.id().expect("a live call names its request");
+            assert!(!take_request_cancellation(Some(id)));
+        }
+        // Dropping the op before it settles is the caller's abort.
+        assert!(take_request_cancellation(Some(id)));
+        // A second sample finds nothing: the abort is consumed once.
+        assert!(!take_request_cancellation(Some(id)));
+        assert!(!take_request_cancellation(Some(id)));
+    }
+
+    #[test]
+    fn a_settled_call_does_not_publish_an_abort() {
+        let id;
+        {
+            let mut cancel = RpcCallCancel::new();
+            id = cancel.id().expect("a live call names its request");
+            cancel.disarm();
+        }
+        assert!(!take_request_cancellation(Some(id)));
+    }
+
+    #[test]
+    fn a_late_publication_is_cleared_when_the_drive_exits() {
+        // The caller vanished as the event finished: the abort is published
+        // after no drive will sample it. The runtime's lifetime clears it so
+        // it cannot outlive the request.
+        let id = next_request_id();
+        abort_request(id);
+        clear_request_cancellation(id);
+        assert!(!take_request_cancellation(Some(id)));
+    }
+
+    #[test]
+    fn rpc_events_report_the_cancellation_id() {
+        let (reply, _receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::Rpc {
+            request_id: Some(7),
+            scope: "DurableObject:test".to_owned(),
+            name: None,
+            method: "wait".to_owned(),
+            args: RpcData::Json("[]".to_owned()),
+            reply,
+        };
+        assert_eq!(job.request_id(), Some(7));
     }
 }

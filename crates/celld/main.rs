@@ -1410,6 +1410,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
         name,
         method,
         args,
+        request_id,
         reply,
     } = call;
     let result = async {
@@ -1425,7 +1426,9 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 .map_err(|error| anyhow::anyhow!("route RPC {scope}: {error:?}"))?;
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
-                    let local_request_id = local_dispatch_request_id(None);
+                    // Use the caller's id so its abort, published when the
+                    // caller's host op is dropped, reaches this cell event.
+                    let local_request_id = local_dispatch_request_id(request_id);
                     let completed = app
                         .local_request(request, scope.clone(), local_request_id, "local")
                         .run(async {

@@ -1836,6 +1836,17 @@ impl RuntimeManager {
         args: js::RpcData,
         request_id: Option<js::RequestId>,
     ) -> anyhow::Result<js::RpcOutcome> {
+        let isolate = match self.cell_isolate(&cell) {
+            Ok(isolate) => isolate,
+            Err(error) => {
+                // No event will observe or clear a cancellation published
+                // while the caller was routing.
+                if let Some(request_id) = request_id {
+                    js::clear_request_cancellation(request_id);
+                }
+                return Err(error);
+            }
+        };
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Rpc {
             request_id,
@@ -1845,8 +1856,20 @@ impl RuntimeManager {
             args,
             reply,
         };
-        self.cell_event(&cell, job, receive, "cell isolate dropped RPC result")
-            .await
+        // The event can be abandoned while its callee is suspended: the
+        // caller's host op is dropped on disconnect, which publishes this
+        // request's abort, and the drive loop samples it between turns. The
+        // lifetime is what clears the flag when the drive exits, so a late
+        // publication cannot become a tombstone.
+        let cancellation = request_id.map(RequestCancellationLifetime::from_request_id);
+        tokio::spawn(drive_cell_with_request_cancellation(
+            isolate,
+            job,
+            Some(self.alarm_reporter.clone()),
+            None,
+            cancellation,
+        ));
+        receive.await.context("cell isolate dropped RPC result")?
     }
 
     pub async fn ws_message(

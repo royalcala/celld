@@ -188,6 +188,10 @@ pub struct RpcCallReq {
     pub name: Option<String>,
     pub method: String,
     pub args: RpcData,
+    /// Names the callee event so a caller that abandons the call can stop it.
+    /// The caller publishes an abort by this id; the cell drive loop samples
+    /// it between turns and fails the event.
+    pub request_id: Option<crate::js::RequestId>,
     pub reply: tokio::sync::oneshot::Sender<Result<RpcData>>,
 }
 pub(crate) static RPC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcCallReq>> =

@@ -3947,6 +3947,19 @@ const __opTrack = (ctx, reject) => {
     if (set.size === 0) __ctxPendingOps.delete(ctx);
   };
 };
+// Race a host op against the current request context's abort. Rejecting here
+// only settles the JS promise; the caller's event then ends and drops the op
+// future, which is what publishes the owner-side cancellation.
+const __trackHostOp = (promise) => {
+  const ctx = __ctxNow();
+  if (ctx === undefined) return promise;
+  return new Promise((resolve, reject) => {
+    const untrack = __opTrack(ctx, reject);
+    promise.then(
+      (value) => { untrack(); resolve(value); },
+      (error) => { untrack(); reject(error); });
+  });
+};
 const __ctxRegister = (meta) => {
   if (meta.ctx === undefined) return;
   let set = __ctxStubs.get(meta.ctx);
@@ -4741,10 +4754,11 @@ const __foreignStub = (token, state, durable = false, stored = false) => {
   // used. The owner's own operation is bounded by the host call.
   const guard = (promise) => {
     if (meta.disposed) return Promise.reject(__stubDisposedError());
+    const tracked = __trackHostOp(promise);
     return new Promise((resolve, reject) => {
       const rejectDisposed = (error) => reject(error);
       meta.rejectors.add(rejectDisposed);
-      promise.then(
+      tracked.then(
         (value) => { meta.rejectors.delete(rejectDisposed); resolve(value); },
         (error) => { meta.rejectors.delete(rejectDisposed); reject(error); },
       );
@@ -5565,11 +5579,11 @@ class DurableObjectNamespace {
       // target. Same-process dispatch re-enters this isolate, where the
       // abort and exit markers revive; bytes that land elsewhere revive as
       // loud foreign stubs.
-      return async (...args) => invoke(
-        async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true),
-        )),
-      );
+      return async (...args) => invoke(async () => {
+        const reply = await __trackHostOp(__rpc_call(
+          scope, dispatchName ?? null, prop, __rpcOut(args, true)));
+        return __rpcDes(reply);
+      });
     }});
     __doStubMeta.set(stub, id);
     return stub;
@@ -11596,6 +11610,10 @@ const __entrypointContext = (props = __defaultProps) => ({
       __newEntry(target), typeof target === "function");
   },
 });
+// The default export is called straight from the host, so it needs the
+// request frame here: `ctx.abort()` and I/O confinement both key off it.
+__celld.__callDefaultFetch = (fetch, request, env, ctx) =>
+  __ctxRun(undefined, () => fetch.call(undefined, request, env, ctx));
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
   __event_begin();
