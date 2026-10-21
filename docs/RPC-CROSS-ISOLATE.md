@@ -201,7 +201,8 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
   RPC/stream paths, `/metrics`, rotation.
 - `tools/s3gw` acceptance (`celld diagnose` + the CAS race) and CI jobs:
   `check`, `two-node`, `secrets`.
-- The celld-os app-level 2-node tests are the manager's uncommitted diff.
+- The celld-os app-level 2-node tests are committed in celld-os (`39e7ba9b` takeover,
+  `5e89287d` hook after a hard kill).
 
 ## Fork and PR
 
