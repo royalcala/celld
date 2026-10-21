@@ -2028,6 +2028,10 @@ pub struct WorkerConfig {
     declares_queue_consumer: bool,
     workflow_bindings: Vec<WorkflowBinding>,
     vars: Vec<(String, String)>,
+    /// Decrypted deployment secrets. Installed into `env` as `secret_text`
+    /// (string) or `secret_key` (ArrayBuffer) when the isolate boots; the
+    /// plaintext never leaves this process.
+    secrets: Vec<crate::secrets::SecretBinding>,
     node: String,
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
@@ -2150,6 +2154,7 @@ impl WorkerConfig {
             queue_consumers,
             workflow_bindings,
             vars,
+            secrets,
             node,
             modules,
             compat,
@@ -2181,6 +2186,7 @@ impl WorkerConfig {
             declares_queue_consumer,
             workflow_bindings,
             vars,
+            secrets,
             node,
             modules,
             compat,
@@ -7898,6 +7904,7 @@ fn op_loader_load(
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),
             vars: Vec::new(),
+            secrets: Vec::new(),
             node: String::new(),
             modules,
             compat,
@@ -11060,7 +11067,11 @@ fn op_log(
     } else {
         "log".to_string()
     };
-    let body = msg.join(" ");
+    // Secret values are redacted before anything retains the line: the tail
+    // log, the OTLP record, and the console trace all see the same text. The
+    // cap keeps one runaway console line from filling every sink.
+    let body = crate::secrets::redact(&msg.join(" "));
+    let body = crate::secrets::cap_log(&body);
     if let Some(context) = current_reaction_or_untracked_io_context(scope) {
         context.record_tail_log(&level, &body);
     }

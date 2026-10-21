@@ -898,6 +898,13 @@ async fn load_worker_at_pointer(
         .collect();
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest);
+    let secrets = load_secrets(
+        bucket,
+        &pointer.prefix,
+        &manifest.script_name,
+        manifest.secrets.as_ref(),
+    )
+    .await?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
@@ -943,6 +950,7 @@ async fn load_worker_at_pointer(
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,
             vars,
+            secrets,
             node,
             modules,
             compat,
@@ -979,6 +987,50 @@ pub struct LoadedDeployment {
     pub containers: Vec<crate::container::ContainerSpec>,
     /// See `Manifest::fence_image`.
     pub fence_image: Option<String>,
+}
+
+/// Decrypts a deployment's secrets once, at adoption. Callers get the
+/// plaintext only inside `WorkerConfig`; the bucket holds ciphertext and the
+/// manifest holds names plus the blob hash.
+async fn load_secrets(
+    bucket: &Bucket,
+    prefix: &str,
+    script_name: &str,
+    reference: Option<&crate::protocol::SecretManifestRef>,
+) -> anyhow::Result<Vec<crate::secrets::SecretBinding>> {
+    let Some(reference) = reference else {
+        return Ok(Vec::new());
+    };
+    let key = crate::secrets::FleetKey::from_env().with_context(|| {
+        format!(
+            "script {script_name:?} carries encrypted secrets, but CELLD_SECRET_KEY is not set \
+             (32 bytes, 64 hex)"
+        )
+    })?;
+    let key_path = crate::protocol::secret_blob_key(prefix);
+    let Some((bytes, _)) = bucket.get(&key_path).await? else {
+        bail!("script {script_name:?}: encrypted secrets {key_path} are missing from the bucket");
+    };
+    let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    anyhow::ensure!(
+        digest == reference.sha256,
+        "script {script_name:?}: encrypted secrets do not match the manifest \
+         (partial upload or tampering)"
+    );
+    let plain = crate::secrets::decrypt(&key, script_name, &bytes)?;
+    anyhow::ensure!(
+        plain.len() == reference.entries.len(),
+        "script {script_name:?}: encrypted secrets have a different entry set than the manifest"
+    );
+    for (secret, entry) in plain.iter().zip(reference.entries.iter()) {
+        anyhow::ensure!(
+            secret.name == entry.name && secret.kind == entry.kind,
+            "script {script_name:?}: encrypted secret {:?} does not match the manifest",
+            entry.name
+        );
+    }
+    crate::secrets::register_redactions(&plain);
+    Ok(plain.into_iter().map(Into::into).collect())
 }
 
 fn bindings<'a>(

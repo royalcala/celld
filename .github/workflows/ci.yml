@@ -109,3 +109,54 @@ jobs:
             S3_LOCAL_ROOT=/tmp/s3gw-data \
             CELLD_BIN=target/debug/celld CELLD_ESBUILD="$(command -v esbuild)" \
             bash scripts/e2e-2node.sh
+
+  secrets:
+    name: Fleet secrets (encrypted at rest)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    # Deploys a fixture with secret_text + secret_key, proves the bucket and
+    # the manifest hold no plaintext, proves the right/wrong/missing
+    # CELLD_SECRET_KEY behaviour, and rotates a value to a new version. The
+    # pre-C refusal probe needs an older binary and is skipped here; the
+    # runbook instead requires upgrading every node before the first secrets
+    # deploy (docs/SECRETS.md).
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" \
+            --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_VERSION"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-secrets-${{ env.RUST_VERSION }}
+
+      - name: Build celld and the S3 gateway
+        run: |
+          set -euo pipefail
+          cargo build --bin celld
+          cargo build --release --manifest-path tools/s3gw/Cargo.toml
+
+      - name: Install esbuild
+        run: npm install --global esbuild
+
+      - name: Secrets deploy E2E
+        env:
+          S3GW_BIN: ${{ github.workspace }}/tools/s3gw/target/release/us-s3gw
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/s3gw-secrets/celld-secrets
+          "$S3GW_BIN" --host 127.0.0.1 --port 9000 \
+            --access-key minioadmin --secret-key minioadmin /tmp/s3gw-secrets &
+          for _ in $(seq 1 80); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            [ -n "$code" ] && [ "$code" != "000" ] && break
+            sleep 0.25
+          done
+          S3_ENDPOINT=http://127.0.0.1:9000 S3_BUCKET=celld-secrets \
+            S3_LOCAL_ROOT=/tmp/s3gw-secrets \
+            CELLD_BIN=target/debug/celld CELLD_ESBUILD="$(command -v esbuild)" \
+            bash scripts/e2e-secrets.sh

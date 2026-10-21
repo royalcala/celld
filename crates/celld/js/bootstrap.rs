@@ -7,6 +7,7 @@
 //! the bindings — `env`, the routing table, the compatibility flags — which
 //! differ per worker and are therefore built every time.
 use super::*;
+use base64::Engine as _;
 
 /// Per-process compiled-bytecode cache for the fixed bootstrap scripts.
 /// Every cell wake pays a fresh isolate, and without this each one re-parses
@@ -669,6 +670,22 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for (name, value) in vars {
             lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
+        }
+        for secret in &config.secrets {
+            match secret.kind {
+                crate::secrets::SecretKind::Text => {
+                    let value = std::str::from_utf8(&secret.value)
+                        .map_err(|_| anyhow!("secret {:?} is not UTF-8", secret.name))?;
+                    lines.push_str(&format!("e[{:?}] = {:?};\n", secret.name, value));
+                }
+                crate::secrets::SecretKind::Key => {
+                    let value = base64::engine::general_purpose::STANDARD.encode(&secret.value);
+                    lines.push_str(&format!(
+                        "e[{:?}] = __celld.__secretKey({:?});\n",
+                        secret.name, value
+                    ));
+                }
+            }
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(

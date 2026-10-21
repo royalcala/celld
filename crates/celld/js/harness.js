@@ -11813,6 +11813,15 @@ const __entrypointContext = (props = __defaultProps) => ({
 // request frame here: `ctx.abort()` and I/O confinement both key off it.
 __celld.__callDefaultFetch = (fetch, request, env, ctx) =>
   __ctxRun(undefined, () => fetch.call(undefined, request, env, ctx));
+// `secret_key` bindings are ArrayBuffers. The value arrives base64 because the
+// env bootstrap is JavaScript source that may end up in a compile-error
+// message; the host registers that encoding with the redactor.
+__celld.__secretKey = (encoded) => {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+};
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
   __event_begin();

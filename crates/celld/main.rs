@@ -4077,6 +4077,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 queue_consumers: Vec::new(),
                 workflow_bindings,
                 vars: Vec::new(),
+                secrets: Vec::new(),
                 node: node.clone(),
                 modules: Vec::new(),
                 compat: Compat::default(),

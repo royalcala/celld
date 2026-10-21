@@ -26,6 +26,12 @@ pub struct Manifest {
     pub modules: Vec<ModuleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets: Option<AssetManifestRef>,
+    /// Encrypted deployment secrets. The values live in
+    /// `<prefix>/secrets.json` as AES-256-GCM ciphertext; this reference names
+    /// the entries and the envelope hash so a node can verify and decrypt
+    /// without ever reading a plaintext value from the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretManifestRef>,
     /// Cron trigger expressions from the config's `triggers.crons`. They are
     /// deployment state rather than cell state: the reserved cron cell reads
     /// them from the manifest it is running under, so changing a schedule
@@ -54,6 +60,25 @@ pub struct Manifest {
     pub raw_metadata: serde_json::Value,
 }
 
+/// The encrypted secret entries of a deployment, without their values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretManifestRef {
+    /// SHA-256 (lowercase hex) of `<prefix>/secrets.json`.
+    pub sha256: String,
+    pub entries: Vec<SecretManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretManifestEntry {
+    pub name: String,
+    pub kind: crate::secrets::SecretKind,
+}
+
+/// The envelope object a deployment's secrets live in.
+pub fn secret_blob_key(prefix: &str) -> String {
+    format!("{prefix}/secrets.json")
+}
+
 fn legacy_manifest_schema_version() -> u32 {
     1
 }
@@ -71,6 +96,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_QUEUES_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
+    FEATURE_SECRETS_V1,
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
@@ -95,6 +121,10 @@ pub const FEATURE_CRON_V1: &str = "cron-v1";
 /// application calls, at request time, on a node the developer is not
 /// watching — the gate moves that failure to the deploy.
 pub const FEATURE_R2_V1: &str = "r2-v1";
+/// A deployment with encrypted `secrets`. Required because a node that
+/// predates the secret bootstrap would otherwise load the manifest, ignore the
+/// `secret_text`/`secret_key` names, and serve `undefined` to the application.
+pub const FEATURE_SECRETS_V1: &str = "secrets-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
 /// A deployment whose `main` is a `.py` file. Required because the bundle

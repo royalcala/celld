@@ -17,8 +17,9 @@ use crate::note;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
-    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
+    Rollout, RunWorkerFirst, SecretManifestEntry, SecretManifestRef, FEATURE_ASSETS_V1,
+    FEATURE_CONTAINERS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
+    FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SECRETS_V1,
     FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
@@ -51,6 +52,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "services",
     "triggers",
     "vars",
+    "secrets",
     "d1_databases",
     "kv_namespaces",
     "queues",
@@ -209,6 +211,17 @@ pub struct Options {
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+    /// Values for the config's declared `secrets`. Values are read from files
+    /// (or one stdin secret); a literal on the command line is refused so it
+    /// does not land in shell history or the process list.
+    pub secrets: std::collections::BTreeMap<String, SecretInput>,
+}
+
+/// Where a `--secret` value comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecretInput {
+    File(PathBuf),
+    Stdin,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -234,7 +247,9 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  --secret NAME=@FILE    Read a secret the config declares from FILE;\n                         literal values are refused so they cannot leak\n                         through argv\n  --secret-file NAME=FILE\n                         Alias of --secret NAME=@FILE; FILE may be - for one\n                         stdin secret\n  -h, --help             Show this help\n\n\
+Secrets are encrypted with CELLD_SECRET_KEY (32 bytes, 64 hex characters) and\n\
+uploaded as ciphertext; the config only names them. See docs/SECRETS.md.\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -263,6 +278,7 @@ pub fn options_from_arguments(
         local_images: false,
         json: false,
         vars: VarOverrides::None,
+        secrets: BTreeMap::new(),
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -284,6 +300,52 @@ pub fn options_from_arguments(
             }
             "--region" => {
                 options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            "--secret" => {
+                let value = arguments.next().context("--secret requires NAME=@FILE")?;
+                let (name, source) = value
+                    .split_once('=')
+                    .with_context(|| format!("--secret {value:?} must be NAME=@FILE"))?;
+                anyhow::ensure!(
+                    valid_binding(name),
+                    "--secret {name:?}: not a valid binding name"
+                );
+                let file = source.strip_prefix('@').with_context(|| {
+                    format!(
+                        "--secret {name}: values are read from a file; use {name}=@FILE (a literal value would leak through argv)"
+                    )
+                })?;
+                let input = if file == "-" {
+                    SecretInput::Stdin
+                } else {
+                    SecretInput::File(PathBuf::from(file))
+                };
+                anyhow::ensure!(
+                    options.secrets.insert(name.to_string(), input).is_none(),
+                    "--secret {name}: supplied twice"
+                );
+            }
+            "--secret-file" => {
+                let value = arguments
+                    .next()
+                    .context("--secret-file requires NAME=FILE")?;
+                let (name, file) = value
+                    .split_once('=')
+                    .with_context(|| format!("--secret-file {value:?} must be NAME=FILE"))?;
+                anyhow::ensure!(
+                    valid_binding(name),
+                    "--secret-file {name:?}: not a valid binding name"
+                );
+                let file = file.strip_prefix('@').unwrap_or(file);
+                let input = if file == "-" {
+                    SecretInput::Stdin
+                } else {
+                    SecretInput::File(PathBuf::from(file))
+                };
+                anyhow::ensure!(
+                    options.secrets.insert(name.to_string(), input).is_none(),
+                    "--secret-file {name}: supplied twice"
+                );
             }
             other if other.starts_with('-') => {
                 bail!("unknown argument for `celld deploy`: {other}")
@@ -322,6 +384,14 @@ struct Project {
     /// Set when `main` is a `.py` file: the Python behavior its
     /// compatibility date and flags select.
     python: Option<python::PythonCompat>,
+    /// Secret bindings the config declares by name. Values arrive only
+    /// through `Options.secrets` and are encrypted into the deployment.
+    secret_decls: Vec<SecretDecl>,
+}
+
+struct SecretDecl {
+    name: String,
+    kind: crate::secrets::SecretKind,
 }
 
 /// The two Wrangler bundling knobs that celld forwards to esbuild.
@@ -424,6 +494,9 @@ pub struct Built {
     pub manifest: Manifest,
     pub modules: Vec<(String, Vec<u8>)>,
     pub assets: Option<BuiltAssets>,
+    /// The encrypted secrets envelope, uploaded beside the manifest. Never
+    /// holds plaintext.
+    pub secrets: Option<Vec<u8>>,
     pub bundled_in: Duration,
     /// The resolved image ids of `containers[]`, in config order.
     pub images: Vec<String>,
@@ -551,6 +624,14 @@ impl Built {
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
                     )),
+                    Some("secret_text") => Some((
+                        format!("env.{name} (Secret)"),
+                        "Encrypted text secret".to_string(),
+                    )),
+                    Some("secret_key") => Some((
+                        format!("env.{name} (Secret Key)"),
+                        "Encrypted key secret".to_string(),
+                    )),
                     _ => None,
                 }
             })
@@ -582,6 +663,14 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let mut project = read_project(&config_path, &root, &options.vars)?;
+    // Secrets are encrypted before the version is computed: the ciphertext
+    // hash is part of the deployment's identity, so rotating a value is a new
+    // version even when the config and bundle are unchanged. The plaintext
+    // never enters the metadata or the manifest.
+    let (secret_envelope, secret_ref) = prepare_secrets(&project, options)?;
+    if let Some(reference) = &secret_ref {
+        project.metadata["secrets"] = serde_json::to_value(reference)?;
+    }
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
     // A fleet deploy builds for the platform the nodes run, which Wrangler
@@ -697,6 +786,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             })
             .collect(),
         assets: asset_reference,
+        secrets: secret_ref.clone(),
         crons: project.crons.clone(),
         containers: container_specs.clone(),
         fence_image: fence_image.clone(),
@@ -739,6 +829,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             if python_runtime {
                 features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
             }
+            if secret_ref.is_some() {
+                features.push(FEATURE_SECRETS_V1.to_string());
+            }
             features
         },
         raw_metadata: project.metadata,
@@ -750,11 +843,109 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         manifest,
         modules,
         assets: built_assets,
+        secrets: secret_envelope,
         bundled_in,
         images,
         fence_image,
         upload_images: !options.local_images,
     })
+}
+
+/// Encrypts the values the operator supplied for the config's declared
+/// secrets. The ciphertext hash goes into the deployment identity (a rotated
+/// value is a new version) and the envelope is uploaded beside the manifest.
+/// No plaintext or key material leaves this function.
+fn prepare_secrets(
+    project: &Project,
+    options: &Options,
+) -> anyhow::Result<(Option<Vec<u8>>, Option<SecretManifestRef>)> {
+    if project.secret_decls.is_empty() {
+        if let Some(name) = options.secrets.keys().next() {
+            bail!("--secret {name}: the config declares no secrets");
+        }
+        return Ok((None, None));
+    }
+    if options.dry_run {
+        if !options.secrets.is_empty() {
+            note!(
+                "warning: --dry-run ignores the supplied secret values; the preview version omits them"
+            );
+        }
+        return Ok((None, None));
+    }
+    if options
+        .secrets
+        .values()
+        .filter(|input| matches!(input, SecretInput::Stdin))
+        .count()
+        > 1
+    {
+        bail!("--secret: at most one secret can be read from stdin");
+    }
+    let key = crate::secrets::FleetKey::from_env().context(
+        "the config declares secrets, so deploy needs CELLD_SECRET_KEY (32 bytes, 64 hex characters)",
+    )?;
+    let declared: BTreeMap<&str, crate::secrets::SecretKind> = project
+        .secret_decls
+        .iter()
+        .map(|decl| (decl.name.as_str(), decl.kind))
+        .collect();
+    for name in options.secrets.keys() {
+        anyhow::ensure!(
+            declared.contains_key(name.as_str()),
+            "--secret {name}: the config does not declare that secret"
+        );
+    }
+    let mut plain = Vec::with_capacity(project.secret_decls.len());
+    let mut stdin_used = false;
+    for decl in &project.secret_decls {
+        let input = options.secrets.get(&decl.name).ok_or_else(|| {
+            anyhow!(
+                "no value for secret {:?}: pass --secret {}=@FILE",
+                decl.name,
+                decl.name
+            )
+        })?;
+        let value = match input {
+            SecretInput::File(path) => std::fs::read(path)
+                .with_context(|| format!("secret {:?}: read {}", decl.name, path.display()))?,
+            SecretInput::Stdin => {
+                anyhow::ensure!(!stdin_used, "--secret: stdin can supply only one secret");
+                stdin_used = true;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                    .with_context(|| format!("secret {:?}: read stdin", decl.name))?;
+                bytes
+            }
+        };
+        anyhow::ensure!(
+            !value.is_empty(),
+            "secret {:?}: the value is empty",
+            decl.name
+        );
+        if decl.kind == crate::secrets::SecretKind::Text {
+            anyhow::ensure!(
+                std::str::from_utf8(&value).is_ok(),
+                "secret {:?}: a text secret must be UTF-8",
+                decl.name
+            );
+        }
+        plain.push(crate::secrets::PlainSecret {
+            name: decl.name.clone(),
+            kind: decl.kind,
+            value,
+        });
+    }
+    let envelope = crate::secrets::encrypt(&key, &project.script_name, &plain)?;
+    let sha256 = crate::secrets::envelope_sha256(&envelope);
+    let entries = plain
+        .iter()
+        .map(|secret| SecretManifestEntry {
+            name: secret.name.clone(),
+            kind: secret.kind,
+        })
+        .collect();
+    Ok((Some(envelope), Some(SecretManifestRef { sha256, entries })))
 }
 
 /// Whether `image` names a Dockerfile in the project rather than an image
@@ -911,6 +1102,17 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
             .put(
                 &format!("{}/assets.json", built.prefix),
                 assets.index.clone(),
+            )
+            .await?;
+    }
+    // The encrypted envelope lands before the manifest that names it, so a
+    // reader never sees a deployment whose secrets are still in flight. The
+    // object is ciphertext; plaintext only ever exists in deploy's memory.
+    if let Some(secrets) = &built.secrets {
+        bucket
+            .put(
+                &crate::protocol::secret_blob_key(&built.prefix),
+                secrets.clone(),
             )
             .await?;
     }
@@ -1875,6 +2077,38 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "name": binding,
         }));
     }
+    let mut secret_decls = Vec::new();
+    match object.get("secrets") {
+        None => {}
+        Some(Value::Object(entries)) => {
+            for (name, kind) in entries {
+                let kind = kind.as_str().ok_or_else(|| {
+                    anyhow!(
+                        "secret {name} must be the string \"text\" or \"key\"; \
+                         values come from --secret at deploy time, never the config"
+                    )
+                })?;
+                let kind = crate::secrets::SecretKind::parse(kind)
+                    .with_context(|| format!("config `secrets` entry {name:?}"))?;
+                if !valid_binding(name) {
+                    bail!("invalid secret binding name: {name:?}");
+                }
+                // The manifest names the binding; the value is injected by the
+                // node from the encrypted envelope, never from metadata.
+                bindings.push(json!({
+                    "type": kind.binding_type(),
+                    "name": name,
+                }));
+                secret_decls.push(SecretDecl {
+                    name: name.clone(),
+                    kind,
+                });
+            }
+        }
+        Some(_) => {
+            bail!("config `secrets` must be an object mapping names to \"text\" or \"key\"")
+        }
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -1939,6 +2173,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             || !sqlite_classes.is_empty()
             || service_count > 0
             || declared_vars
+            || !secret_decls.is_empty()
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -2012,6 +2247,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         has_r2: !r2_buckets.is_empty(),
         containers,
         python,
+        secret_decls,
     })
 }
 

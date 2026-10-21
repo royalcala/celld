@@ -1,0 +1,11 @@
+{
+  // Names and kinds only. Values are passed to `celld deploy --secret` and
+  // encrypted with CELLD_SECRET_KEY; the config never holds a value.
+  "name": "celld-secrets-fixture",
+  "main": "index.js",
+  "compatibility_date": "2026-09-04",
+  "secrets": {
+    "API_TOKEN": "text",
+    "TLS_KEY": "key"
+  }
+}

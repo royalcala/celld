@@ -309,6 +309,9 @@ pub struct WorkerConfigOptions {
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub vars: Vec<(String, String)>,
+    /// Decrypted secrets for this generation. The deploy side stores the
+    /// envelope encrypted; the fleet loads and decrypts it once per version.
+    pub secrets: Vec<crate::secrets::SecretBinding>,
     pub node: String,
     pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,
