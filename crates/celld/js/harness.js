@@ -213,7 +213,10 @@ class CelldBodyStream extends ReadableStream {
 class CelldHttpBodyStream extends ReadableStream {
   constructor(streamId) {
     const id = Number(streamId);
+    // A host body is bytes, so it is a byte stream: a BYOB reader works on
+    // it, as it does on a body fetched in Workerd.
     super({
+      type: "bytes",
       async pull(controller) {
         // A chunk arrives as a Uint8Array. The host moves it in without
         // a copy. The end of the stream arrives as a string.
@@ -3998,6 +4001,12 @@ const __disposeStub = (meta) => {
   if (meta.disposed) return;
   meta.disposed = true;
   __ctxUnregister(meta);
+  // A capability this isolate received owns an exported reference, not a
+  // local entry: releasing it is what reaches the owner.
+  if (meta.token !== undefined) {
+    try { __cap_release(meta.token); } catch {}
+    return;
+  }
   const entry = meta.entry;
   if (--entry.refs > 0) return;
   __stubEntries.delete(entry.id);
@@ -4099,17 +4108,30 @@ const __writableBridge = (writer) => {
   };
   return bridge;
 };
+// A facet lives in an isolate but is not a published cell, so its bridge is
+// routed as a stateless capability to the isolate that holds it. Everything
+// else inside a cell event is owned by that cell.
+const __capOwner = (entry) =>
+  entry.scope === undefined || __cell.facetConfigs[entry.scope] !== undefined
+    ? [2, ""]
+    : [1, entry.scope];
 const __liftStream = (v) => {
   const readable = v instanceof ReadableStream;
   const key = readable ? "__celld$rs" : "__celld$ws";
   const meta = __rpcStreamMeta.get(v);
-  if (meta !== undefined && !meta.disposed && !v.locked) {
-    // Re-serializing a received, untouched stream forwards the
-    // original handle: the reference moves (like a stub) and
-    // the local wrapper is dead -- a round trip stays one hop.
-    meta.disposed = true;
-    __ctxUnregister(meta);
-    return { [key]: meta.entry.id, t: __stubIsolate };
+  if (meta !== undefined) {
+    if (meta.disposed)
+      throw new TypeError(
+        "The stream's RPC handle was already transferred or disposed.");
+    if (!v.locked) {
+      // Re-serializing a received, untouched stream forwards its capability:
+      // the reference moves (like a stub) and the local wrapper is dead, so a
+      // round trip stays one hop.
+      meta.disposed = true;
+      __ctxUnregister(meta);
+      __remoteStubFinalizer.unregister(meta);
+      return { [key]: meta.token };
+    }
   }
   if (v.locked)
     throw new TypeError(readable
@@ -4118,7 +4140,9 @@ const __liftStream = (v) => {
   const bridge = readable
     ? __readableBridge(v.getReader())
     : __writableBridge(v.getWriter());
-  return { [key]: __newEntry(bridge).id, t: __stubIsolate };
+  const entry = __newEntry(bridge);
+  const [kind, owner] = __capOwner(entry);
+  return { [key]: __cap_mint(kind, owner, entry.id, 0) };
 };
 // A signal is not a snapshot on the RPC wire. The marker carries a
 // process-wide identity, and the host forwards the source's single state
@@ -4434,41 +4458,48 @@ const __reviveResponse = (marker, revive) => {
 // stream hot paths. Read errors surface as Workerd's generic
 // premature-disconnect; write errors propagate (Workerd sends
 // real errors back through the write loop).
-const __foreignStreamOp = () => Promise.reject(new Error(
-  "RPC streams cannot cross isolate boundaries yet."));
-const __reviveStream = (marker, id, readable, handles) => {
-  const entry = marker.t === __stubIsolate
-    ? __stubEntries.get(id) : undefined;
-  if (entry === undefined)
-    return readable
-      ? new ReadableStream({ pull: __foreignStreamOp })
-      : new WritableStream({ write: __foreignStreamOp,
-          close: __foreignStreamOp, abort: __foreignStreamOp });
-  const meta = { entry, disposed: false, ctx: __ctxNow() };
+// The token authenticates the bridge; every operation is one bounded reverse
+// call to the isolate that holds the source. The zero-arg operations still
+// carry an (empty) argument list: a null argument list is a property read.
+// A received readable is a byte stream, as in Workers RPC, so a BYOB reader
+// works on it even when the sender's source was a default stream.
+const __reviveStream = (token, readable, handles) => {
+  const meta = { token, disposed: false, ctx: __ctxNow() };
   __ctxRegister(meta);
   handles.push(meta);
+  const op = (path, args) => meta.disposed
+    ? Promise.reject(__stubDisposedError())
+    : __stub_rpc_call_token(
+        token, JSON.stringify(path), __rpcOut(args, true),
+      ).then((bytes) => __rpcDes(bytes));
   const stream = readable
     ? new ReadableStream({
+        type: "bytes",
         async pull(controller) {
           let result;
           try {
-            result = await __stubOp(meta, ["read"], []);
+            result = await op(["read"], []);
           } catch {
             throw __rsDisconnect();
           }
           if (result.done) controller.close();
-          else controller.enqueue(result.value);
+          else if (ArrayBuffer.isView(result.value))
+            controller.enqueue(result.value);
+          else if (result.value instanceof ArrayBuffer)
+            controller.enqueue(new Uint8Array(result.value));
+          else
+            throw new TypeError(
+              "RPC streams carry byte chunks only.");
         },
-        cancel: () =>
-          __stubOp(meta, ["cancel"], []).catch(() => {}),
+        cancel: () => op(["cancel"], []).catch(() => {}),
       }, { highWaterMark: 0 })
     : new WritableStream({
-        write: (chunk) => __stubOp(meta, ["write"], [chunk]),
-        close: () => __stubOp(meta, ["close"], []),
-        abort: () =>
-          __stubOp(meta, ["abort"], []).catch(() => {}),
+        write: (chunk) => op(["write"], [chunk]),
+        close: () => op(["close"], []),
+        abort: () => op(["abort"], []).catch(() => {}),
       });
   __rpcStreamMeta.set(stream, meta);
+  __remoteStubFinalizer.register(stream, token, meta);
   return stream;
 };
 const __reviveSignal = (marker, id) => {
@@ -4521,11 +4552,9 @@ const __stubRevive = (value) => {
     if (v["__celld$res"] !== undefined)
       return __reviveResponse(v, revive);
     const rsId = v["__celld$rs"];
-    if (rsId !== undefined)
-      return __reviveStream(v, rsId, true, handles);
+    if (rsId !== undefined) return __reviveStream(rsId, true, handles);
     const wsId = v["__celld$ws"];
-    if (wsId !== undefined)
-      return __reviveStream(v, wsId, false, handles);
+    if (wsId !== undefined) return __reviveStream(wsId, false, handles);
     const sigId = v["__celld$sig"];
     if (sigId !== undefined) return __reviveSignal(v, sigId);
     if (seen.has(v)) return v;
@@ -10124,9 +10153,11 @@ if (!globalThis.Blob) {
     async arrayBuffer() { return this._bytes.slice().buffer; }
     async bytes() { return this._bytes.slice(); }
     async text() { return new TextDecoder().decode(this._bytes); }
+    // A byte stream, as in Workerd, so BYOB readers work on it.
     stream() {
       const bytes = this._bytes;
       return new ReadableStream({
+        type: "bytes",
         start(controller) {
           if (bytes.byteLength) controller.enqueue(bytes.slice());
           controller.close();

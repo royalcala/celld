@@ -582,6 +582,43 @@ mod tests {
     }
 
     #[test]
+    fn capability_flags_are_authenticated() {
+        let key = key();
+        let mut bridge = claims();
+        bridge.handle = 11;
+        // Reserved flags ride in the signed payload, so a bridge can label a
+        // handle without letting a receiver relabel it.
+        bridge.flags = 1;
+        let token = key.mint(&bridge).expect("mint");
+        assert_eq!(key.verify(&token).expect("verify"), bridge);
+
+        let mut payload = encode_claims(&bridge).expect("encode");
+        payload[2] = 0;
+        let relabelled = key.sign_payload(&payload).expect("sign");
+        assert_eq!(
+            key.verify(&relabelled).expect("verify").flags,
+            0,
+            "flags follow the signed payload"
+        );
+    }
+
+    #[test]
+    fn stream_bridge_reference_disposes_on_release() {
+        let mut refs = CapabilityRefs::default();
+        // `__liftStream` mints the bridge entry, which registers one exported
+        // reference for the receiving side.
+        assert_eq!(refs.retain("OverseerDurableObject:abc", 11), 1);
+        // Disposing the received stream (explicitly or at context end) is the
+        // last release, which is what tells the owner to cancel/abort its
+        // source.
+        assert_eq!(refs.release("OverseerDurableObject:abc", 11), Some(true));
+        assert!(refs.is_empty());
+        // Teardown can reach the same handle twice; a duplicate release is
+        // inert rather than an underflow.
+        assert_eq!(refs.release("OverseerDurableObject:abc", 11), None);
+    }
+
+    #[test]
     fn exported_refs_are_shared_by_owner_and_handle() {
         let mut refs = CapabilityRefs::default();
         assert_eq!(refs.retain("scope-a", 3), 1);
