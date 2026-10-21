@@ -14,6 +14,7 @@
 //! async in JS, synchronous underneath — the ops are sync Rust, wrapped in
 //! `async` by the JS harness.
 use crate::asyncrt;
+use crate::capability::{CapabilityClaims, CapabilityKey, CapabilityKind};
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
@@ -6823,6 +6824,8 @@ ops! { OP_NAMES, install_op_functions,
         "__rpc_signal_unsubscribe" => op_rpc_signal_unsubscribe,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
+        "__cap_mint" => op_cap_mint,
+        "__stub_rpc_call_token" => op_stub_rpc_call_token,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -8948,6 +8951,147 @@ fn op_rpc_signal_wait(
         let value = v8::String::new(scope, &request_id_string(subscription)).unwrap();
         object.set(scope, key.into(), value.into());
     }
+    rv.set(promise);
+}
+
+/// Process-local capability key. A fleet build derives this from the fleet
+/// secret during startup; a single node mints its own so tokens cannot be
+/// forged by JavaScript in this process.
+fn capability_key() -> &'static CapabilityKey {
+    static KEY: OnceLock<CapabilityKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).expect("OS random source unavailable");
+        CapabilityKey::new(bytes)
+    })
+}
+
+/// `__cap_mint(kind, owner, handle, flags)` -> opaque capability token.
+fn op_cap_mint(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let requested_kind = args.get(0).integer_value(scope).unwrap_or_default();
+    let owner = args.get(1).to_rust_string_lossy(scope);
+    let handle = args.get(2).integer_value(scope).unwrap_or_default().max(0) as u64;
+    let flags = args
+        .get(3)
+        .integer_value(scope)
+        .unwrap_or_default()
+        .clamp(0, i64::from(u8::MAX)) as u8;
+    // The owner is authority, so derive it from the running event rather than
+    // trusting a string supplied by JavaScript. A cell event names its scope;
+    // a stateless isolate names its heap.
+    let context = event_context(scope);
+    let (kind, owner) = match requested_kind {
+        1 => match current_cell_event(&context) {
+            Some(frame) if owner.is_empty() || owner == frame.storage => {
+                (CapabilityKind::Cell, frame.storage)
+            }
+            Some(_) => {
+                loader_throw(scope, "capability owner does not match the running cell");
+                return;
+            }
+            None => {
+                loader_throw(scope, "cell capability minted outside a cell event");
+                return;
+            }
+        },
+        2 => match crate::pool::current_slot() {
+            Some(slot) if owner.is_empty() => {
+                (CapabilityKind::Stateless, slot.heap_id().to_string())
+            }
+            Some(_) => {
+                loader_throw(scope, "stateless capability owner is host-derived");
+                return;
+            }
+            None => {
+                loader_throw(scope, "stateless capability minted outside an isolate");
+                return;
+            }
+        },
+        _ => {
+            loader_throw(scope, "this capability kind cannot be minted yet");
+            return;
+        }
+    };
+    let claims = CapabilityClaims {
+        kind,
+        owner,
+        node: String::new(),
+        generation: 0,
+        handle,
+        flags,
+    };
+    match capability_key().mint(&claims) {
+        Ok(token) => {
+            let token = v8::String::new(scope, &token).unwrap();
+            rv.set(token.into());
+        }
+        Err(error) => loader_throw(scope, &error.to_string()),
+    }
+}
+
+/// `__stub_rpc_call_token(token, pathJson, argsSc)` -> Promise<Uint8Array>.
+///
+/// The token authenticates the owner and handle. Cell-owned capabilities ride
+/// the existing native Durable Object RPC path, so routing, activation and
+/// cross-node forwarding are the same as a normal DO method call.
+fn op_stub_rpc_call_token(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    let path_value = args.get(1);
+    let path = if path_value.is_null_or_undefined() {
+        "null".to_owned()
+    } else {
+        path_value.to_rust_string_lossy(scope)
+    };
+    let args_value = args.get(2);
+    let args_bytes = if args_value.is_null_or_undefined() {
+        bytes::Bytes::new()
+    } else {
+        bytes::Bytes::copy_from_slice(&view_bytes(args_value).unwrap_or_default())
+    };
+    let claims = match capability_key().verify(&token) {
+        Ok(claims) => claims,
+        Err(error) => {
+            loader_throw(scope, &error.to_string());
+            return;
+        }
+    };
+    if claims.kind != CapabilityKind::Cell {
+        loader_throw(
+            scope,
+            "this capability kind cannot cross isolate boundaries yet",
+        );
+        return;
+    }
+    let method = format!("__celldStubOp:{}:{}", claims.handle, path);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = RpcCallReq {
+        scope: claims.owner,
+        name: None,
+        method,
+        args: RpcData::V8(args_bytes),
+        reply: tx,
+    };
+    let id = asyncrt::enqueue(async move {
+        gated_channel_send(gate, &RPC_CALL_TX, request, "no RPC channel").await?;
+        match rx.await {
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+            Ok(Ok(RpcData::Json(_))) => {
+                Err("RPC answered JSON to a structured-clone stub call".into())
+            }
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("RPC proxy dropped: {e}")),
+        }
+    });
+    let promise = promise_for(scope, id);
     rv.set(promise);
 }
 
