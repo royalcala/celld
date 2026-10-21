@@ -200,10 +200,12 @@ printf '%s' "$TOKEN2" > "$TOKEN_FILE"
 deploy "$TOKEN_FILE" "$DEPLOY_JSON"
 VERSION2=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$DEPLOY_JSON")
 [ "$VERSION" != "$VERSION2" ] || { echo "FAIL: rotation reused the version" >&2; exit 1; }
-for _ in $(seq 1 100); do
+# The node adopts a new deployment at its next pointer poll (default 30s), so
+# wait longer than one poll before calling rotation broken.
+for _ in $(seq 1 240); do
   got=$(curl -fsS --max-time 1 "http://127.0.0.1:$port/token" 2>/dev/null || true)
   [ "$got" = "$TOKEN2" ] && break
-  sleep 0.2
+  sleep 0.25
 done
 [ "$got" = "$TOKEN2" ] || { echo "FAIL: node did not adopt the rotated secret" >&2; exit 1; }
 echo "   version $VERSION -> $VERSION2; rotated secret served"
