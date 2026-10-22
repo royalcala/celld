@@ -449,6 +449,10 @@ pub fn ws_pull_unregister(id: u64) {
 pub struct WorkerWebSocket {
     pub(crate) id: u64,
     pub(crate) inbound: WsPullSender,
+    /// Frames the backend produced for this socket. It moves with the handoff so
+    /// the caller isolate can pump them to the real client; leaving it behind made
+    /// backend-to-client frames vanish into an `outputs` map nobody read.
+    pub(crate) outbound: tokio::sync::mpsc::UnboundedReceiver<WsOut>,
 }
 
 impl WorkerWebSocket {
@@ -458,6 +462,11 @@ impl WorkerWebSocket {
 
     pub fn inbound(&self) -> WsPullSender {
         self.inbound.clone()
+    }
+
+    /// Move the backend's outbound queue to the caller that pumps the real client.
+    pub fn take_outbound(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<WsOut> {
+        std::mem::replace(&mut self.outbound, tokio::sync::mpsc::unbounded_channel().1)
     }
 }
 
@@ -537,7 +546,7 @@ pub struct FacetSocket {
 pub struct WsRegistry {
     pub(crate) outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
     pub metadata: HashMap<u64, WsMeta>,
-    pub(crate) worker_handoffs: HashMap<u64, WsPullSender>,
+    pub(crate) worker_handoffs: HashMap<u64, WorkerWebSocket>,
 }
 impl WsRegistry {
     #[doc(hidden)]

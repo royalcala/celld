@@ -22,15 +22,20 @@ pub(super) struct WsCapture {
 fn prepare_worker_websocket_handoff(id: u64) {
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
-    ws_register_outbound(id, "", None);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    ws_register(id, outbound);
     ws_track_request_socket(id);
     let registry = ws_registry();
-    let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
+    let replaced = registry
+        .lock()
+        .unwrap()
+        .worker_handoffs
+        .insert(id, WorkerWebSocket { id, inbound, outbound: outbound_rx });
     drop(replaced);
 }
 
 pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSocket> {
-    let inbound = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
+    let worker = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
     current_context()
@@ -38,7 +43,7 @@ pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSock
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
-    Some(WorkerWebSocket { id, inbound })
+    Some(worker)
 }
 
 /// Close every isolate-polled socket a finished request opened.

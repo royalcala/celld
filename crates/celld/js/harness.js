@@ -3691,9 +3691,25 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
       : r.body !== undefined
         ? r.body
         : Uint8Array.from(r.bodyBytes || []);
+    // A service-binding upgrade can be a cell target or a worker handoff.
+    // For a worker handoff the host re-registered the pull channel in this
+    // isolate under workerSocketId; present it as an accepted socket so
+    // __readResponse adopts it with that id.
+    const ws = r.status === 101
+      ? r.wsTarget
+        ? new WebSocket(undefined, [], r.wsTarget)
+        : r.workerSocketId
+          ? Object.assign(new WebSocket(undefined, [], null), {
+              _accepted: true,
+              _id: r.workerSocketId,
+              _serviceBindingHandoff: true,
+            })
+          : undefined
+      : undefined;
     return __finishServiceFetch(
       new Response(responseBody, {
         status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        webSocket: ws,
       }),
       req, redirectState);
   },
@@ -5891,13 +5907,26 @@ class DurableObjectNamespace {
         // socket the host joins to the cell's on `accept()`. A caller that
         // returns this response instead of accepting keeps the direct route
         // `__wsTarget` already describes, and binds nothing.
+        // A service-binding upgrade can be a cell target or a worker handoff.
+        // For a worker handoff the host already re-registered the pull channel
+        // in this isolate under workerSocketId; present it as an accepted
+        // socket so __readResponse adopts it with that id.
+        const ws = r.status === 101
+          ? r.wsTarget
+            ? new WebSocket(undefined, [], r.wsTarget)
+            : r.workerSocketId
+              ? Object.assign(new WebSocket(undefined, [], null), {
+                  _accepted: true,
+                  _id: r.workerSocketId,
+                  _serviceBindingHandoff: true,
+                })
+              : undefined
+          : undefined;
         return new Response(body, {
           status: r.status,
           headers: r.headers,
           __wsTarget: r.wsTarget,
-          webSocket: r.status === 101 && r.wsTarget
-            ? new WebSocket(undefined, [], r.wsTarget)
-            : undefined,
+          webSocket: ws,
         });
     };
     const stub = new Proxy(target, { get: (_target, prop) => {
@@ -12442,18 +12471,23 @@ __celld.__readResponse = (r) => {
   let workerSocketId = 0;
   let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
   if (r.status === 101 && r.webSocket && wsTarget === null) {
-    const server = r.webSocket._peer;
+    // The response can carry either end of the pair: a client end (whose peer
+    // is the accepted server) or the accepted server end itself.
+    const server = r.webSocket._accepted ? r.webSocket : r.webSocket._peer;
     if (server && server._accepted) {
       workerSocketId = server._id;
       // Install the host queue before the pump asks for its first frame. The
       // target marker makes sends use that queue instead of remaining in the
-      // pair's pre-upgrade buffer.
-      __ws_prepare_worker_handoff(workerSocketId);
-      server._target = { id: workerSocketId, scope: "" };
-      server._polled = true;
-      __sockets.set(workerSocketId, server);
-      server._startPump();
-      server._flushPending();
+      // pair's pre-upgrade buffer. A service-binding handoff already registered
+      // its queue when it crossed isolates; preparing here would replace it.
+      if (!server._serviceBindingHandoff) {
+        __ws_prepare_worker_handoff(workerSocketId);
+        server._target = { id: workerSocketId, scope: "" };
+        server._polled = true;
+        __sockets.set(workerSocketId, server);
+        server._startPump();
+        server._flushPending();
+      }
     }
   }
   const bodyStreamId = r._bodyBytes === null

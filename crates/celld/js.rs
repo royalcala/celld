@@ -13740,7 +13740,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         )
     };
     if status == 101 {
-        tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
+        tracing::info!(%ws_json, has_target = ws.is_some(), worker_id, has_worker_ws = worker_ws.is_some(), "JS WebSocket response");
     }
     let websocket = match (ws, worker_ws) {
         (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),

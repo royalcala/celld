@@ -1758,11 +1758,25 @@ pub(crate) fn encode_http_response(
         "headers": response.headers,
     });
     if ws_target {
-        let target = match response.websocket.as_ref() {
-            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
-            _ => None,
-        };
-        obj["wsTarget"] = serde_json::json!(target);
+        match response.websocket.take() {
+            Some(HttpResponseWebSocket::Cell(target)) => {
+                obj["wsTarget"] = serde_json::json!(target);
+            }
+            Some(HttpResponseWebSocket::Worker(worker)) => {
+                let id = worker.id();
+                // The response crossed isolates. Move the whole handoff (inbound
+                // queue plus outbound receiver) into the caller's registry so
+                // __readResponse's transfer finds it and the caller can pump
+                // frames in both directions.
+                crate::ws_registry::ws_registry()
+                    .lock()
+                    .unwrap()
+                    .worker_handoffs
+                    .insert(id, worker);
+                obj["workerSocketId"] = serde_json::json!(id);
+            }
+            None => {}
+        }
     }
     if let Some(stream) = response.stream.take() {
         let Some(stream_id) = stream_service.register_source(HttpStreamSource::Stream(stream))

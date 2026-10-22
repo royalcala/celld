@@ -927,7 +927,7 @@ where
 /// `__ws_next` operation therefore keeps this request and isolate resident,
 /// and this task carries each client frame through that operation's queue.
 async fn worker_websocket_task<S>(
-    worker: celld::js::WorkerWebSocket,
+    mut worker: celld::js::WorkerWebSocket,
     mut socket: fastwebsockets::WebSocket<S>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -935,8 +935,23 @@ async fn worker_websocket_task<S>(
     socket.set_auto_close(false);
     let id = worker.id();
     let inbound = worker.inbound();
-    let (outbound, mut outputs) = mpsc::unbounded_channel();
-    celld::js::ws_register(id, outbound);
+    // Frames reach the client from two places: the backend's own outbound queue
+    // (moved with the handoff) and the caller isolate's emits for this id. Merge
+    // both into one queue and register the caller's outputs entry so a caller
+    // emit during/after teardown is not dropped.
+    let (caller_tx, mut caller_rx) = mpsc::unbounded_channel();
+    celld::js::ws_register(id, caller_tx);
+    let mut backend_rx = worker.take_outbound();
+    let (merged_tx, mut outputs) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(frame) = backend_rx.recv() => { if merged_tx.send(frame).is_err() { break; } }
+                Some(frame) = caller_rx.recv() => { if merged_tx.send(frame).is_err() { break; } }
+                else => break,
+            }
+        }
+    });
     let (close, writer) = pump_cell_socket(socket, &mut outputs, true, move |data| {
         let inbound = inbound.clone();
         async move {
