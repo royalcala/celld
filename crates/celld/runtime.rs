@@ -2662,6 +2662,9 @@ struct StatelessTiming {
     remote_parent: Option<crate::telemetry::ParentContext>,
     /// Why the handler failed, read from the entry when it was answered.
     failure: Option<String>,
+    /// Host thread CPU, read from the entry when it was answered and only
+    /// present when `CELLD_CPU_SPANS=1`.
+    cpu_ms: Option<f64>,
     span_name: &'static str,
     span_kind: u8,
 }
@@ -2716,6 +2719,7 @@ impl StatelessTiming {
             trace,
             remote_parent,
             failure: None,
+            cpu_ms: None,
             span_name,
             span_kind,
         }
@@ -2729,6 +2733,7 @@ impl StatelessTiming {
         }
         self.emitted = true;
         self.failure = entry.failure().map(str::to_string);
+        self.cpu_ms = entry.cpu_millis();
         self.emit();
     }
 
@@ -2738,6 +2743,7 @@ impl StatelessTiming {
             let mut span = crate::telemetry::Span::new(ids, self.span_name, self.span_kind);
             span.start_unix_us = crate::telemetry::now_unix_us() - total_us;
             span.duration_us = total_us;
+            span.cpu_ms = self.cpu_ms;
             span.ok = self.failure.is_none();
             span.error = self.failure.clone();
             span.request_id = self.request_id.map(js::request_id_string);
@@ -3081,6 +3087,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
                     crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
                 span.start_unix_us = start_unix;
                 span.duration_us = started.elapsed().as_micros() as i64;
+                span.cpu_ms = entry.cpu_millis();
                 span.ok = entry.finished() && entry.failure().is_none();
                 span.error = entry.failure().map(str::to_string);
                 span.parent_span_id = remote.map(|parent| parent.span_id);
@@ -3661,6 +3668,7 @@ async fn drive_cell_inner(
         let mut span = crate::telemetry::Span::new(ids, name, kind);
         span.start_unix_us = start_unix;
         span.duration_us = started.elapsed().as_micros() as i64;
+        span.cpu_ms = entry.cpu_millis();
         span.ok = entry.finished() && entry.failure().is_none();
         span.error = entry.failure().map(str::to_string);
         span.cell = Some(cell);

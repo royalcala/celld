@@ -53,6 +53,13 @@ fn field_fixed64(out: &mut Vec<u8>, field: u64, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// common.v1.AnyValue: double_value=4 (fixed64 IEEE-754 bits).
+fn any_double(value: f64) -> Vec<u8> {
+    let mut out = Vec::new();
+    field_fixed64(&mut out, 4, value.to_bits());
+    out
+}
+
 /// common.v1.AnyValue: string_value=1, bool_value=2, int_value=3.
 fn any_string(value: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 4);
@@ -145,6 +152,9 @@ fn span_message(span: &Span) -> Vec<u8> {
     if let Some(queue_wait_us) = span.queue_wait_us {
         key_value(&mut out, 9, "celld.queue_wait_us", any_int(queue_wait_us));
     }
+    if let Some(cpu_ms) = span.cpu_ms {
+        key_value(&mut out, 9, "celld.cpu_ms", any_double(cpu_ms));
+    }
     if let Some(remote) = span.parent_remote {
         key_value(&mut out, 9, "celld.parent_remote", any_bool(remote));
     }
@@ -210,4 +220,36 @@ pub fn logs_request(logs: &[Log], node: &str, region: &str, service: &str) -> Ve
     let mut out = Vec::new();
     field_bytes(&mut out, 1, &resource_logs);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::TraceIds;
+
+    #[test]
+    fn cpu_ms_is_a_double_attribute_and_parquet_column() {
+        let mut span = Span::new(
+            TraceIds {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+            },
+            "celld.fetch",
+            crate::telemetry::KIND_SERVER,
+        );
+        span.cpu_ms = Some(1.5);
+        let message = span_message(&span);
+        assert!(message
+            .windows(b"celld.cpu_ms".len())
+            .any(|window| window == b"celld.cpu_ms"));
+        // common.v1.AnyValue.double_value is field 4, wire type fixed64 (0x21).
+        let mut payload = vec![0x21];
+        payload.extend_from_slice(&1.5f64.to_bits().to_le_bytes());
+        assert!(message
+            .windows(payload.len())
+            .any(|window| window == payload));
+        // The optional Parquet column is written in schema order.
+        crate::telemetry::encode_spans(&[span], "node", "region")
+            .expect("encode a span with cpu_ms");
+    }
 }

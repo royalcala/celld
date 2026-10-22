@@ -326,6 +326,8 @@ pub struct Span {
     pub kind: u8,
     pub start_unix_us: i64,
     pub duration_us: i64,
+    /// Host thread CPU for this event/request, when `CELLD_CPU_SPANS=1`.
+    pub cpu_ms: Option<f64>,
     pub ok: bool,
     pub error: Option<String>,
     pub request_id: Option<String>,
@@ -403,6 +405,7 @@ impl Span {
             kind,
             start_unix_us: 0,
             duration_us: 0,
+            cpu_ms: None,
             ok: true,
             error: None,
             request_id: None,
@@ -1100,6 +1103,7 @@ message celld_span {
   required int32 kind (INTEGER(8,false));
   required int64 start_unix_us;
   required int64 duration_us;
+  optional double cpu_ms;
   required boolean ok;
   optional binary error (STRING);
   optional binary request_id (STRING);
@@ -1136,6 +1140,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     use parquet::data_type::BoolType;
     use parquet::data_type::ByteArray;
     use parquet::data_type::ByteArrayType;
+    use parquet::data_type::DoubleType;
     use parquet::data_type::Int32Type;
     use parquet::data_type::Int64Type;
     use parquet::file::properties::WriterProperties;
@@ -1190,6 +1195,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(Int32Type, req each.clone().map(|s| s.kind as i32).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|s| s.duration_us).collect::<Vec<_>>());
+    column!(DoubleType, opt each.clone().map(|s| s.cpu_ms).collect::<Vec<_>>());
     column!(BoolType, req each.clone().map(|s| s.ok).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.error.as_deref().map(text)).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.request_id.as_deref().map(text)).collect::<Vec<_>>());

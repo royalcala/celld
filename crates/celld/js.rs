@@ -1984,6 +1984,18 @@ fn effective_resource_limits(
 struct CpuTurnStart {
     thread_nanos: Option<u64>,
     wall: Instant,
+    /// The caller thread's CPU clock for the opt-in span attribute. `None`
+    /// unless `CELLD_CPU_SPANS=1`; the limit accounting above is unchanged.
+    target_clock: Option<TargetThreadCpuClock>,
+    target_started: Option<u64>,
+}
+
+/// Whether spans carry the opt-in host CPU attribute. Off by default, so a
+/// normal turn pays nothing; when set, the same target-thread clock the CPU
+/// watchdog uses samples each turn. The JavaScript clocks are untouched.
+fn span_cpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CELLD_CPU_SPANS").ok().as_deref() == Some("1"))
 }
 
 #[derive(Clone)]
@@ -3814,6 +3826,11 @@ impl InFlight {
     /// Why the event failed, when a sampled trace captured it.
     pub fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
+    }
+
+    /// Host thread CPU this event spent, when `CELLD_CPU_SPANS=1`.
+    pub(crate) fn cpu_millis(&self) -> Option<f64> {
+        self.context.cpu_millis()
     }
 
     pub(crate) fn finish_tail_report(&mut self) {
@@ -12111,6 +12128,9 @@ pub struct IoContext {
     cpu_limit_nanos: Option<u64>,
     cpu_used_nanos: AtomicU64,
     cpu_turn: Mutex<Option<CpuTurnStart>>,
+    /// Whether this context accumulates host thread CPU for span `cpu_ms`.
+    span_cpu: bool,
+    span_cpu_nanos: AtomicU64,
     /// Whether this event records console calls for a Dynamic Worker tail.
     tail_reporting: bool,
     tail_logs: Mutex<TailLogCapture>,
@@ -12212,13 +12232,27 @@ impl IoContext {
     }
 
     fn begin_cpu_turn(&self) {
-        if self.cpu_limit_nanos.is_none() {
+        if self.cpu_limit_nanos.is_none() && !self.span_cpu {
             return;
         }
+        let target_clock = if self.span_cpu {
+            TargetThreadCpuClock::current()
+        } else {
+            None
+        };
         *self.cpu_turn.lock().unwrap() = Some(CpuTurnStart {
             thread_nanos: thread_cpu_nanos(),
             wall: Instant::now(),
+            target_started: target_clock.and_then(TargetThreadCpuClock::nanos),
+            target_clock,
         });
+    }
+
+    /// Host thread CPU this context spent, for the opt-in span attribute.
+    /// `None` while `CELLD_CPU_SPANS` is off.
+    pub(crate) fn cpu_millis(&self) -> Option<f64> {
+        self.span_cpu
+            .then(|| self.span_cpu_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0)
     }
 
     fn remaining_cpu_budget(&self) -> Option<Duration> {
@@ -12228,10 +12262,21 @@ impl IoContext {
     }
 
     fn finish_cpu_turn(&self) -> Result<(), String> {
-        let Some(limit) = self.cpu_limit_nanos else {
+        if self.cpu_limit_nanos.is_none() && !self.span_cpu {
+            return Ok(());
+        }
+        let Some(started) = self.cpu_turn.lock().unwrap().take() else {
             return Ok(());
         };
-        let Some(started) = self.cpu_turn.lock().unwrap().take() else {
+        if self.span_cpu {
+            if let (Some(clock), Some(begin)) = (started.target_clock, started.target_started) {
+                if let Some(end) = clock.nanos() {
+                    self.span_cpu_nanos
+                        .fetch_add(end.saturating_sub(begin), Ordering::Relaxed);
+                }
+            }
+        }
+        let Some(limit) = self.cpu_limit_nanos else {
             return Ok(());
         };
         let elapsed = started
@@ -12265,6 +12310,19 @@ impl IoContext {
     }
 
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
+        Self::with_options_and_cpu(limits, tail_reporting, span_cpu_enabled())
+    }
+
+    #[cfg(test)]
+    fn with_span_cpu_for_test(enabled: bool) -> Arc<Self> {
+        Self::with_options_and_cpu(None, false, enabled)
+    }
+
+    fn with_options_and_cpu(
+        limits: Option<ResourceLimits>,
+        tail_reporting: bool,
+        span_cpu: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             continuation: None,
             call_chains: Mutex::new(CallChains::default()),
@@ -12290,6 +12348,8 @@ impl IoContext {
                 .map(|milliseconds| u64::from(milliseconds).saturating_mul(1_000_000)),
             cpu_used_nanos: AtomicU64::new(0),
             cpu_turn: Mutex::new(None),
+            span_cpu,
+            span_cpu_nanos: AtomicU64::new(0),
             tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
         })
@@ -12325,6 +12385,8 @@ impl IoContext {
                 .map(|milliseconds| u64::from(milliseconds).saturating_mul(1_000_000)),
             cpu_used_nanos: AtomicU64::new(0),
             cpu_turn: Mutex::new(None),
+            span_cpu: span_cpu_enabled(),
+            span_cpu_nanos: AtomicU64::new(0),
             // Tracked contexts drive cell and RPC events. Dynamic Worker tail
             // reports currently belong only to fetch jobs, whose untracked
             // context is constructed from the report sender in `begin`.
@@ -13864,5 +13926,31 @@ mod rpc_cancellation_tests {
             reply,
         };
         assert_eq!(job.request_id(), Some(7));
+    }
+}
+
+#[cfg(test)]
+mod cpu_span_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_millis_is_off_unless_opted_in() {
+        let context = IoContext::with_span_cpu_for_test(false);
+        context.begin_cpu_turn();
+        assert!(context.finish_cpu_turn().is_ok());
+        assert_eq!(context.cpu_millis(), None);
+    }
+
+    #[test]
+    fn cpu_millis_accumulates_when_opted_in() {
+        let context = IoContext::with_span_cpu_for_test(true);
+        context.begin_cpu_turn();
+        let until = Instant::now() + std::time::Duration::from_millis(5);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        assert!(context.finish_cpu_turn().is_ok());
+        let millis = context.cpu_millis().expect("span CPU is enabled");
+        assert!(millis > 0.0, "expected host CPU time, got {millis} ms");
     }
 }
