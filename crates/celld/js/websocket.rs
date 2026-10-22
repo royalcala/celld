@@ -26,11 +26,14 @@ fn prepare_worker_websocket_handoff(id: u64) {
     ws_register(id, outbound);
     ws_track_request_socket(id);
     let registry = ws_registry();
-    let replaced = registry
-        .lock()
-        .unwrap()
-        .worker_handoffs
-        .insert(id, WorkerWebSocket { id, inbound, outbound: outbound_rx });
+    let replaced = registry.lock().unwrap().worker_handoffs.insert(
+        id,
+        WorkerWebSocket {
+            id,
+            inbound,
+            outbound: outbound_rx,
+        },
+    );
     drop(replaced);
 }
 
