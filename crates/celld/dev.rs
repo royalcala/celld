@@ -643,22 +643,12 @@ async fn run_stack(
         .context("the Wrangler config has no project directory")?;
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(project, options.watch_ignores.clone()))
         .transpose()?;
 
     console.progress("building the application");
     deploy_project(config, store, options.logs).await?;
-    let mut running = start_node(
-        state,
-        options.listener,
-        options.internal_port,
-        options.metrics,
-        options.logs,
-        project_hash,
-        store,
-        console,
-    )
-    .await?;
+    let mut running = start_node(state, &options, project_hash, store, console).await?;
 
     loop {
         match wait_for_node_event(&mut running.child, &mut signals, watcher.as_mut()).await? {
@@ -681,17 +671,7 @@ async fn run_stack(
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
-                running = start_node(
-                    state,
-                    options.listener,
-                    options.internal_port,
-                    options.metrics,
-                    options.logs,
-                    project_hash,
-                    store,
-                    console,
-                )
-                .await?;
+                running = start_node(state, &options, project_hash, store, console).await?;
             }
         }
     }
@@ -712,17 +692,14 @@ enum NodeEvent {
 #[allow(clippy::disallowed_methods)] // Child supervision uses real host process and time APIs.
 async fn start_node(
     state: &Path,
-    listener: SocketAddr,
-    internal_port: u16,
-    metrics: bool,
-    logs: bool,
+    options: &StackOptions,
     project_hash: &str,
     store: &Store,
     console: &Console,
 ) -> anyhow::Result<RunningNode> {
     let executable = std::env::current_exe().context("locate the celld executable")?;
-    let listen = listener.to_string();
-    let internal_listen = format!("127.0.0.1:{internal_port}");
+    let listen = options.listener.to_string();
+    let internal_listen = format!("127.0.0.1:{}", options.internal_port);
     let mut command = Command::new(executable);
     // The supervisor owns the child's complete storage and listener topology.
     // Inherited fleet settings can otherwise override that private topology or
@@ -762,7 +739,7 @@ async fn start_node(
     // path. An error or cancellation can instead drop it, so the child must
     // not outlive the value that proves the supervisor still owns it.
     command.kill_on_drop(true);
-    if !logs {
+    if !options.logs {
         // The supervisor still forwards ERROR records and the child's stderr.
         // INFO and WARN records stay hidden until the operator asks for them.
         command.env("RUST_LOG", "error");
@@ -804,6 +781,7 @@ async fn start_node(
         .expect("the local node was configured with piped output");
     let (internal_tx, internal_rx) = oneshot::channel();
     let output_console = *console;
+    let logs = options.logs;
     let output = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut internal_tx = Some(internal_tx);
@@ -833,13 +811,13 @@ async fn start_node(
         }
     };
 
-    if let Err(error) = wait_for_node(&mut child, listener).await {
+    if let Err(error) = wait_for_node(&mut child, options.listener).await {
         stop_child(&mut child, Some(&internal)).await;
         let _ = output.await;
         return Err(error);
     }
-    console.ready(&format!("http://{listener}"));
-    if metrics {
+    console.ready(&format!("http://{}", options.listener));
+    if options.metrics {
         console.detail("metrics", &metrics_url(&internal));
     }
     Ok(RunningNode {
