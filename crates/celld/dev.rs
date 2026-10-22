@@ -96,6 +96,10 @@ impl DevState {
 #[derive(Debug)]
 struct StackOptions {
     listener: SocketAddr,
+    /// The operator listener's port; `0` lets the kernel choose one.
+    internal_port: u16,
+    /// Print the discovered internal `/metrics` URL when the node is ready.
+    metrics: bool,
     logs: bool,
     watch: bool,
     watch_ignores: Vec<Pattern>,
@@ -333,7 +337,7 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--internal-port PORT] [--metrics]\n            [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
@@ -343,7 +347,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --internal-port PORT   Operator listener port (default: ephemeral)\n  --metrics              Print the internal metrics URL when the node is ready\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -352,6 +356,8 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut project = None;
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
+    let mut internal_port = 0;
+    let mut metrics = false;
     let mut clean = false;
     let mut logs = false;
     let mut watch = true;
@@ -362,7 +368,19 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             "--help" | "-h" => return Ok(None),
             "--clean" => clean = true,
             "--logs" => logs = true,
+            "--metrics" => metrics = true,
             "--no-watch" => watch = false,
+            "--internal-port" => {
+                let value = arguments
+                    .next()
+                    .context("--internal-port requires a value")?;
+                internal_port = value
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid --internal-port value {value:?}"))?;
+                if internal_port == 0 {
+                    bail!("--internal-port must be between 1 and 65535");
+                }
+            }
             "--watch-ignore" => {
                 let value = arguments
                     .next()
@@ -400,6 +418,8 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
+            internal_port,
+            metrics,
             logs,
             watch,
             watch_ignores,
@@ -631,6 +651,8 @@ async fn run_stack(
     let mut running = start_node(
         state,
         options.listener,
+        options.internal_port,
+        options.metrics,
         options.logs,
         project_hash,
         store,
@@ -662,6 +684,8 @@ async fn run_stack(
                 running = start_node(
                     state,
                     options.listener,
+                    options.internal_port,
+                    options.metrics,
                     options.logs,
                     project_hash,
                     store,
@@ -689,6 +713,8 @@ enum NodeEvent {
 async fn start_node(
     state: &Path,
     listener: SocketAddr,
+    internal_port: u16,
+    metrics: bool,
     logs: bool,
     project_hash: &str,
     store: &Store,
@@ -696,6 +722,7 @@ async fn start_node(
 ) -> anyhow::Result<RunningNode> {
     let executable = std::env::current_exe().context("locate the celld executable")?;
     let listen = listener.to_string();
+    let internal_listen = format!("127.0.0.1:{internal_port}");
     let mut command = Command::new(executable);
     // The supervisor owns the child's complete storage and listener topology.
     // Inherited fleet settings can otherwise override that private topology or
@@ -723,7 +750,7 @@ async fn start_node(
             "--listen",
             &listen,
             "--internal-listen",
-            "127.0.0.1:0",
+            &internal_listen,
         ])
         .env("CELLD_INTERNAL_DEV_STORE", &store.database)
         .env("CELLD_WATCH", state.join("runtime"))
@@ -812,6 +839,9 @@ async fn start_node(
         return Err(error);
     }
     console.ready(&format!("http://{listener}"));
+    if metrics {
+        console.detail("metrics", &metrics_url(&internal));
+    }
     Ok(RunningNode {
         child,
         internal,
@@ -825,6 +855,11 @@ fn internal_origin(line: &str) -> Option<String> {
         .split_once(' ')?
         .0;
     Some(format!("http://{address}"))
+}
+
+/// The internal metrics endpoint for a discovered operator origin.
+fn metrics_url(internal: &str) -> String {
+    format!("{internal}/metrics")
 }
 
 #[allow(clippy::disallowed_methods)] // Readiness waits on a real child and wall-clock deadline.
@@ -918,5 +953,56 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
     if waited.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Options>> {
+        options_from_arguments(arguments.iter().map(|value| value.to_string()).collect())
+    }
+
+    #[test]
+    fn operator_listener_defaults_off() {
+        let options = parse(&[]).unwrap().unwrap();
+        assert_eq!(options.stack.internal_port, 0);
+        assert!(!options.stack.metrics);
+    }
+
+    #[test]
+    fn parses_internal_port_and_metrics() {
+        let options = parse(&["--internal-port", "9899", "--metrics"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.stack.internal_port, 9899);
+        assert!(options.stack.metrics);
+    }
+
+    #[test]
+    fn rejects_internal_port_zero_or_missing() {
+        assert!(parse(&["--internal-port", "0"]).is_err());
+        assert!(parse(&["--internal-port"]).is_err());
+        assert!(parse(&["--internal-port", "not-a-port"]).is_err());
+    }
+
+    #[test]
+    fn parses_the_operator_announcement() {
+        assert_eq!(
+            internal_origin(
+                "celld internal listening on 127.0.0.1:4567 (advertise=127.0.0.1:4567)"
+            ),
+            Some("http://127.0.0.1:4567".to_string())
+        );
+        assert_eq!(internal_origin("another line"), None);
+    }
+
+    #[test]
+    fn metrics_url_is_the_operator_endpoint() {
+        assert_eq!(
+            metrics_url("http://127.0.0.1:4567"),
+            "http://127.0.0.1:4567/metrics"
+        );
     }
 }
