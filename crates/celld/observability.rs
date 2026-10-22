@@ -391,6 +391,33 @@ mod tests {
     }
 
     #[test]
+    fn request_and_cell_event_metrics_render() {
+        observe(
+            "celld_http_request_duration_seconds",
+            &[("kind", "fetch"), ("transport", "stateless")],
+            0.25,
+        );
+        observe(
+            "celld_cell_event_duration_seconds",
+            &[("kind", "fetch")],
+            0.5,
+        );
+        inc(
+            "celld_cell_events_total",
+            &[("kind", "fetch"), ("outcome", "ok")],
+        );
+        let text = render();
+        assert!(text.contains(
+            "celld_http_request_duration_seconds_count{kind=\"fetch\",transport=\"stateless\"} 1"
+        ));
+        assert!(text.contains(
+            "celld_http_request_duration_seconds_sum{kind=\"fetch\",transport=\"stateless\"} 0.250000"
+        ));
+        assert!(text.contains("celld_cell_event_duration_seconds_sum{kind=\"fetch\"} 0.500000"));
+        assert!(text.contains("celld_cell_events_total{kind=\"fetch\",outcome=\"ok\"} 1"));
+    }
+
+    #[test]
     fn span_attributes_are_bounded_and_redacted() {
         let secret = "trace-secret-observability-unit".to_owned();
         crate::secrets::register_redactions(&[crate::secrets::PlainSecret {

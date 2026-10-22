@@ -3367,6 +3367,20 @@ fn notify_gated_failure_for_test(
     }
 }
 
+/// The bounded metric label for one cell event.
+fn cell_event_metric_kind(job: &CellJob) -> &'static str {
+    match job {
+        CellJob::Fetch { .. } => "fetch",
+        CellJob::Alarm { .. } => "alarm",
+        CellJob::Rpc { .. } => "rpc",
+        CellJob::WsOpen { .. } | CellJob::WsMessage { .. } | CellJob::WsClosed { .. } => {
+            "websocket"
+        }
+        #[cfg(celld_internal_tests)]
+        CellJob::SyncErrorForTest { .. } => "test",
+    }
+}
+
 async fn drive_cell_inner(
     affiliation: crate::pool::Affiliation,
     mut job: CellJob,
@@ -3376,6 +3390,11 @@ async fn drive_cell_inner(
     request_cancellation: Option<Arc<RequestCancellationLifetime>>,
     #[cfg(celld_internal_tests)] mut test_observers: DriveCellTestObservers,
 ) -> anyhow::Result<Option<u64>> {
+    let metric_kind = cell_event_metric_kind(&job);
+    let _event_timer = crate::observability::Timer::start(
+        "celld_cell_event_duration_seconds",
+        &[("kind", metric_kind)],
+    );
     let _request_cancellation = request_cancellation.map(RequestCancellationGuard::shared);
     // Held to the end of this function: the event's claim on the isolate
     // outlives every suspension, so the pool cannot free the worker under
@@ -3624,6 +3643,15 @@ async fn drive_cell_inner(
         report_alarm_moves(&report, moves);
         alarm_write = write;
     }
+    let outcome = if entry.finished() && entry.failure().is_none() {
+        "ok"
+    } else {
+        "error"
+    };
+    crate::observability::inc(
+        "celld_cell_events_total",
+        &[("kind", metric_kind), ("outcome", outcome)],
+    );
     if let (Some(ids), Some((name, cell, started, start_unix))) = (recording, span_seed) {
         let kind = if name == "celld.cell_fetch" {
             crate::telemetry::KIND_SERVER

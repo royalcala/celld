@@ -2461,10 +2461,26 @@ async fn handle_ingress(
         Err(response) => return *response,
     };
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
-    match app
+    // One stateless Worker request. Labels are the closed set the operator
+    // needs to tell the two request paths apart; the outcome is a counter so
+    // the duration summary stays cardinality-free.
+    let request_timer = celld::observability::Timer::start(
+        "celld_http_request_duration_seconds",
+        &[("kind", "fetch"), ("transport", "stateless")],
+    );
+    let fetched = app
         .fetch_worker(url, method, body, headers, connection)
-        .await
-    {
+        .await;
+    celld::observability::inc(
+        "celld_http_requests_total",
+        &[
+            ("kind", "fetch"),
+            ("transport", "stateless"),
+            ("outcome", if fetched.is_ok() { "ok" } else { "error" }),
+        ],
+    );
+    drop(request_timer);
+    match fetched {
         Ok(worker_response) => {
             reply_without_upgrade(&app, worker_response, preserve_representation_length).await
         }
