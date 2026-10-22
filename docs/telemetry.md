@@ -66,7 +66,50 @@ Durable Object call keeps the trace id, uses a new span id, and keeps the
 sampled flag clear.
 
 Under load, telemetry sheds before requests do, and celld counts what it
-sheds. celld records no metrics yet.
+sheds.
+
+## Metrics
+
+celld serves a Prometheus text exposition at `/metrics` on its **internal
+operator listener**. The Worker listener never exposes it, so keep the internal
+listener on loopback or a trusted private network, like the rest of the
+operator API. The endpoint is unauthenticated and carries no request body,
+header, token, or request-derived label value.
+
+`celld dev` starts its node on an ephemeral operator port. Pass
+`--internal-port PORT` to pin it, and `--metrics` to print the discovered URL
+when the node is ready (and after each reload):
+
+```text
+  ready  http://127.0.0.1:9876
+  metrics  http://127.0.0.1:43210/metrics
+```
+
+| metric | type | labels |
+| --- | --- | --- |
+| `celld_http_request_duration_seconds` | summary (`_sum`/`_count`) | `kind` (`fetch`), `transport` (`stateless`) |
+| `celld_cell_event_duration_seconds` | summary (`_sum`/`_count`) | `kind` (`fetch`, `alarm`, `rpc`, `websocket`) |
+| `celld_http_requests_total` | counter | `kind`, `transport`, `outcome` (`ok`, `error`) |
+| `celld_cell_events_total` | counter | `kind`, `outcome` (`ok`, `error`) |
+| `celld_rpc_calls_total` | counter | `transport` (`local`, `remote`) |
+| `celld_rpc_duration_seconds` | summary | `transport` |
+| `celld_rpc_errors_total` | counter | `code` (a fixed classification) |
+
+The label values are a closed set chosen by the runtime; a request cannot add
+one. Duration summaries expose `_sum` in seconds and `_count` samples, so N
+requests to a stateless Worker and N fetches into a Durable Object each produce
+one sample. Storage, peer, and span counters are documented by their names in
+the exposition itself.
+
+### CPU time per span (opt-in)
+
+Set `CELLD_CPU_SPANS=1` to attach host thread CPU to spans. celld samples the
+existing target-thread CPU clock at the start and end of each JavaScript turn
+and records the total as `cpu_ms` in the Parquet `traces` schema and as the
+`celld.cpu_ms` attribute on OTLP spans. It is off by default and a turn that
+does not ask for it pays nothing extra. JavaScript-visible clocks
+(`performance.now()`, `Date.now()`) are unchanged; this is a host-side
+measurement only.
 
 ## Query the bucket with DuckDB
 
@@ -84,6 +127,10 @@ CREATE VIEW logs AS SELECT * FROM
 -- The slowest requests.
 SELECT name, duration_us, trace_id FROM traces
   ORDER BY duration_us DESC LIMIT 20;
+
+-- Host CPU per span, after running with CELLD_CPU_SPANS=1.
+SELECT name, duration_us, cpu_ms FROM traces
+  WHERE cpu_ms IS NOT NULL ORDER BY cpu_ms DESC LIMIT 20;
 
 -- The error lines.
 SELECT time_unix_us, body FROM logs WHERE severity_number >= 17;
