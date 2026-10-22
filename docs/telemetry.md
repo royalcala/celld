@@ -111,6 +111,37 @@ does not ask for it pays nothing extra. JavaScript-visible clocks
 (`performance.now()`, `Date.now()`) are unchanged; this is a host-side
 measurement only.
 
+### CPU profiles in `celld dev` (opt-in)
+
+`celld dev --profile [DIR]` writes one V8 CPU profile per isolate to `DIR`
+when the node stops. `CELLD_PROFILE=DIR` does the same; the flag wins when both
+are present. Without a value, `--profile` uses `PROJECT/.celld/profiles`.
+
+```bash
+celld dev --profile
+celld dev --profile ./profiles
+CELLD_PROFILE=./profiles celld dev
+```
+
+Profiles are off by default and exist only in `celld dev`. The supervisor
+passes `--profile` to its child node, and the node honours it only together
+with the internal development store, so a normal `celld` node (the production
+invocation, without `celld dev`) never enables it. There is no HTTP endpoint
+for profiles: they are written to local files only, never uploaded, and
+contain script URLs and function names, so treat them like source.
+
+Sampling starts when an isolate loads (after `ready`, on the first request)
+and covers module evaluation and every turn on that isolate. SIGINT and a
+supervisor reload stop sampling, write `slot-NNNN-PID.cpuprofile`, and print
+the path; a reload gets a fresh node and therefore fresh files, not
+overwrites. celld drives V8's Inspector `Profiler.enable/start/stop` on the
+isolate thread with a **1 ms sampling interval**, so expect the usual sampling
+overhead while the dev session runs. The JavaScript-visible clocks
+(`performance.now()`, `Date.now()`) are not changed.
+
+Open a profile in Chrome DevTools' Performance panel, `speedscope`, or any
+`.cpuprofile` viewer.
+
 ## Query the bucket with DuckDB
 
 ```sql

@@ -393,6 +393,20 @@ impl Generation {
         }
     }
 
+    /// Stop dev CPU profiles on every live isolate in this generation.
+    pub(crate) async fn stop_profiles(&self) {
+        let mut seen = std::collections::HashSet::new();
+        let mut pools: Vec<&Arc<crate::pool::Pool>> = Vec::new();
+        pools.push(&self.stateless.isolates);
+        pools.extend(self.services.values().map(|service| &service.isolates));
+        pools.extend(self.cell_isolates.values());
+        for pool in pools {
+            if seen.insert(Arc::as_ptr(pool)) {
+                pool.stop_profiles().await;
+            }
+        }
+    }
+
     /// Whether every isolate of this generation has been freed, so the
     /// generation itself can be dropped.
     pub(crate) fn is_drained(&self) -> bool {

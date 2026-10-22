@@ -268,6 +268,15 @@ impl Slot {
         result
     }
 
+    /// Stop this slot's dev CPU profile. Profiling does not need a turn lane;
+    /// it only needs the isolate lock, and a freed slot has nothing to stop.
+    pub async fn stop_profile(&self) {
+        let mut worker = self.worker.lock().await;
+        if let Some(worker) = worker.as_mut() {
+            worker.stop_profile();
+        }
+    }
+
     /// Reserve one event through its complete lifetime, including the reply
     /// gate. Releasing at the gate would let stalled storage retain unbounded
     /// promises and copied bodies. Cell turn fairness is enforced separately.
@@ -586,6 +595,21 @@ impl Pool {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Stop dev CPU profiles on every live isolate in the pool.
+    pub async fn stop_profiles(&self) {
+        let slots = {
+            self.slots
+                .read()
+                .expect("pool poisoned")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for slot in slots {
+            slot.stop_profile().await;
+        }
     }
 
     fn get(&self, id: IsolateId) -> Arc<Slot> {

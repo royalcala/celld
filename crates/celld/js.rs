@@ -2359,6 +2359,9 @@ pub struct WorkerIsolate {
     /// Named Worker Loader identity lives in this isolate's JavaScript heap,
     /// so no child can remain charged to the registry after its owner is gone.
     loader_owner: LoaderOwner,
+    /// Dev-only V8 CPU profile for this isolate. `None` unless
+    /// `CELD_PROFILE`/`--profile` enabled profiling before the Worker loaded.
+    profiler: Option<crate::profile::Session>,
     /// The storage of the cells this isolate hosts.
     ///
     /// It lives here, and not in a thread-local, because a driven cell's
@@ -3042,11 +3045,38 @@ impl Drop for WorkerIsolate {
         // normally; this removes only the registry's ownership reference.
         let loaded_children = take_loader_owner(&self.loader_owner);
         let limit = self.original_heap_limit;
+        let profiler = self.profiler.take();
         {
             let (mut locker, _cells) = self.lock();
+            if let Some(mut profiler) = profiler {
+                v8::scope!(let scope, &mut *locker);
+                let context = v8::Local::new(scope, &self.realm.context);
+                profiler.stop(Some(context));
+            }
             locker.remove_near_heap_limit_callback(near_heap_limit, limit);
         }
         drop(loaded_children);
+    }
+}
+
+impl Worker {
+    /// Stop this isolate's dev CPU profile, if one is running.
+    pub fn stop_profile(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.stop_profile();
+        }
+    }
+}
+
+impl WorkerIsolate {
+    fn stop_profile(&mut self) {
+        let Some(mut profiler) = self.profiler.take() else {
+            return;
+        };
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let scope, &mut *locker);
+        let context = v8::Local::new(scope, &self.realm.context);
+        profiler.stop(Some(context));
     }
 }
 
@@ -6047,6 +6077,9 @@ impl Worker {
         let compat = config.compat;
         let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
         let mut isolate = v8::Isolate::new(params);
+        // Created before the isolate is shared: the inspector needs `&mut`.
+        // It samples from the context below until the isolate is stopped.
+        let mut profiler = crate::profile::Session::new(&mut isolate);
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
@@ -6087,6 +6120,10 @@ impl Worker {
             let cs = &mut v8::ContextScope::new(hs, context);
             let tc = std::pin::pin!(v8::TryCatch::new(cs));
             let scope = &mut tc.init();
+
+            if let Some(profiler) = profiler.as_mut() {
+                profiler.attach(context);
+            }
 
             let arguments = install_ops(scope);
             install_prelude(scope, &arguments)?; // Web Platform APIs
@@ -6348,6 +6385,7 @@ impl Worker {
                 original_heap_limit,
                 compat,
                 loader_owner,
+                profiler,
                 cells: storage::Cells::default(),
             }),
         })

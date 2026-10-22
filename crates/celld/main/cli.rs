@@ -22,6 +22,9 @@ pub(crate) struct Settings {
     /// Set only by the `celld dev` supervisor for its child node. No fleet
     /// flag or public environment variable selects the local backend.
     pub(crate) dev_store: Option<std::path::PathBuf>,
+    /// Set only by the `celld dev` supervisor: write V8 CPU profiles here.
+    /// Honoured only alongside `dev_store`.
+    pub(crate) profile: Option<std::path::PathBuf>,
 }
 
 pub(crate) enum Action {
@@ -155,6 +158,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         } else {
             std::env::var_os("CELLD_INTERNAL_DEV_STORE").map(std::path::PathBuf::from)
         },
+        profile: None,
     };
     let mut args = arguments.into_iter();
     while let Some(argument) = args.next() {
@@ -200,6 +204,12 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             }
             "--unsafe-public-advertise" => settings.unsafe_public_advertise = true,
             "--trust-forwarded-headers" => settings.trust_forwarded_headers = true,
+            "--profile" => {
+                settings.profile =
+                    Some(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--profile requires a directory")
+                    })?));
+            }
             "--peer" if diagnose => {
                 let peer = args
                     .next()

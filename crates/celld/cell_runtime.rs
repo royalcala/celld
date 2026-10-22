@@ -120,6 +120,20 @@ impl CellRuntime {
         generations.current.id.max(draining) + 1
     }
 
+    /// Stop dev CPU profiles on every isolate this node still holds,
+    /// including generations that are still draining.
+    pub async fn stop_profiles(&self) {
+        let generations = {
+            let generations = self.generations.read().expect("generation lock poisoned");
+            std::iter::once(generations.current.clone())
+                .chain(generations.draining.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        for generation in generations {
+            generation.stop_profiles().await;
+        }
+    }
+
     /// The generations still draining, for `/state`. Each one holds its
     /// isolates until the last cell in them moves, so the caller reads the
     /// census from the generation and not only its version.

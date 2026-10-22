@@ -3749,7 +3749,18 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             )
             .await;
         }
-        Action::Run(settings) => settings,
+        Action::Run(settings) => {
+            // Dev-only: the supervisor passes --profile only to a local node,
+            // which is the only invocation that runs with the dev store.
+            if let Some(dir) = settings.profile.clone() {
+                if settings.dev_store.is_none() {
+                    tracing::warn!("ignoring --profile outside celld dev");
+                } else if let Err(error) = celld::profile::configure(dir) {
+                    anyhow::bail!("could not prepare the profile directory: {error}");
+                }
+            }
+            settings
+        }
     };
     // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
     // a count of process threads also includes unrelated, lazily started
@@ -5727,6 +5738,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         shutdown_accept_failure_test_active,
         "final log flush reached",
     );
+    // Write dev CPU profiles before the hard exit. This is a no-op unless the
+    // dev supervisor enabled profiling. Bounded so a stuck slot cannot keep
+    // the process alive past its shutdown budget.
+    if celld::profile::enabled() {
+        if let Some(runtime) = &app.runtime {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), runtime.stop_profiles())
+                .await
+                .is_err()
+            {
+                eprintln!("celld profile: stopping profiles exceeded 5s");
+            }
+        }
+    }
     exit_flushed(0);
 }
 

@@ -24,6 +24,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_PORT: u16 = 9876;
+
+/// `--profile` without a directory writes here, relative to the project.
+const DEFAULT_PROFILE_DIR: &str = ".celld/profiles";
 const BUCKET: &str = "celld-dev";
 
 /// The narrow bridge used by the supervised binary process. The public fleet
@@ -100,6 +103,9 @@ struct StackOptions {
     internal_port: u16,
     /// Print the discovered internal `/metrics` URL when the node is ready.
     metrics: bool,
+    /// Write V8 CPU profiles here. Absolute: `run` resolves it against the
+    /// project so the child, whose working directory can differ, agrees.
+    profile: Option<PathBuf>,
     logs: bool,
     watch: bool,
     watch_ignores: Vec<Pattern>,
@@ -337,17 +343,20 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--internal-port PORT] [--metrics]\n            [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--internal-port PORT] [--metrics]\n            [--profile [DIR]] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
+--profile writes a V8 CPU profile per isolate to DIR when the node stops\n\
+(default: PROJECT/.celld/profiles; CELLD_PROFILE=DIR does the same). It is\n\
+off by default, dev-only, and the profiles stay on this machine.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --internal-port PORT   Operator listener port (default: ephemeral)\n  --metrics              Print the internal metrics URL when the node is ready\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --internal-port PORT   Operator listener port (default: ephemeral)\n  --metrics              Print the internal metrics URL when the node is ready\n  --profile [DIR]        Write V8 CPU profiles (default: .celld/profiles)\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -362,7 +371,8 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut logs = false;
     let mut watch = true;
     let mut watch_ignores = Vec::new();
-    let mut arguments = arguments.into_iter();
+    let mut profile = None;
+    let mut arguments = arguments.into_iter().peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -370,6 +380,17 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             "--logs" => logs = true,
             "--metrics" => metrics = true,
             "--no-watch" => watch = false,
+            "--profile" => {
+                // The directory is optional. Only consume the next token
+                // when it is not another flag, so `--profile --no-watch`
+                // keeps its meaning.
+                let value = arguments.next_if(|value| !value.starts_with('-'));
+                profile = Some(
+                    value
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROFILE_DIR)),
+                );
+            }
             "--internal-port" => {
                 let value = arguments
                     .next()
@@ -413,6 +434,13 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     if !watch && !watch_ignores.is_empty() {
         bail!("--watch-ignore cannot be used with --no-watch");
     }
+    // The flag wins over the environment. An empty value is how a shell
+    // spells "unset", so it must not enable profiling by accident.
+    if profile.is_none() {
+        profile = std::env::var_os("CELLD_PROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+    }
     Ok(Some(Options {
         project,
         clean,
@@ -420,6 +448,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             listener: SocketAddr::new(host, port),
             internal_port,
             metrics,
+            profile,
             logs,
             watch,
             watch_ignores,
@@ -429,7 +458,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
 
 #[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
 pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
-    let Some(options) = options_from_arguments(arguments)? else {
+    let Some(mut options) = options_from_arguments(arguments)? else {
         print_help()?;
         return Ok(());
     };
@@ -459,6 +488,17 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         );
     }
     prepare_state(state.path())?;
+    if let Some(dir) = options.stack.profile.take() {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            project.join(dir)
+        };
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create profile directory {}", dir.display()))?;
+        console.detail("Profiles", &dir.display().to_string());
+        options.stack.profile = Some(dir);
+    }
     if !options.stack.logs {
         console.detail("Logs", "hidden (use --logs)");
     }
@@ -649,11 +689,13 @@ async fn run_stack(
     console.progress("building the application");
     deploy_project(config, store, options.logs).await?;
     let mut running = start_node(state, &options, project_hash, store, console).await?;
+    let mut announced = std::collections::BTreeSet::new();
 
     loop {
         match wait_for_node_event(&mut running.child, &mut signals, watcher.as_mut()).await? {
             NodeEvent::Exited(status) => {
                 let _ = running.output.await;
+                announce_profiles(console, options.profile.as_deref(), &mut announced);
                 if status.success() {
                     return Ok(());
                 }
@@ -661,6 +703,7 @@ async fn run_stack(
             }
             NodeEvent::Shutdown => {
                 stop_running_node(running).await;
+                announce_profiles(console, options.profile.as_deref(), &mut announced);
                 return Ok(());
             }
             NodeEvent::Reload => {
@@ -671,6 +714,7 @@ async fn run_stack(
                 }
                 console.progress("restarting the application");
                 stop_running_node(running).await;
+                announce_profiles(console, options.profile.as_deref(), &mut announced);
                 running = start_node(state, &options, project_hash, store, console).await?;
             }
         }
@@ -718,6 +762,9 @@ async fn start_node(
         "S3_ENDPOINT",
     ] {
         command.env_remove(variable);
+    }
+    if let Some(profile) = &options.profile {
+        command.arg("--profile").arg(profile);
     }
     command
         .args([
@@ -838,6 +885,37 @@ fn internal_origin(line: &str) -> Option<String> {
 /// The internal metrics endpoint for a discovered operator origin.
 fn metrics_url(internal: &str) -> String {
     format!("{internal}/metrics")
+}
+
+/// Print profile files this run has not announced yet. The node writes them
+/// as it shuts down; the supervisor owns the pretty output, and the set keeps
+/// a reload from repeating paths the operator already saw.
+#[allow(clippy::disallowed_methods)] // Profiles are operator-owned local files.
+fn announce_profiles(
+    console: &Console,
+    dir: Option<&Path>,
+    announced: &mut std::collections::BTreeSet<PathBuf>,
+) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "cpuprofile")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    for path in files {
+        if announced.insert(path.clone()) {
+            console.detail("profile", &path.display().to_string());
+        }
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // Readiness waits on a real child and wall-clock deadline.
@@ -982,5 +1060,22 @@ mod tests {
             metrics_url("http://127.0.0.1:4567"),
             "http://127.0.0.1:4567/metrics"
         );
+    }
+
+    #[test]
+    fn parses_the_profile_directory() {
+        let options = parse(&["--profile"]).unwrap().unwrap();
+        assert_eq!(
+            options.stack.profile,
+            Some(PathBuf::from(DEFAULT_PROFILE_DIR))
+        );
+        let options = parse(&["--profile", "profiles"]).unwrap().unwrap();
+        assert_eq!(options.stack.profile, Some(PathBuf::from("profiles")));
+        let options = parse(&["--profile", "--no-watch"]).unwrap().unwrap();
+        assert_eq!(
+            options.stack.profile,
+            Some(PathBuf::from(DEFAULT_PROFILE_DIR))
+        );
+        assert!(!options.stack.watch);
     }
 }
