@@ -6,7 +6,9 @@ release**, not as a merge of unrelated history.
 
 ## Branch and patch series
 
-- Branch: `celld-os/rpc`.  Do not merge celld `main` into it; rebase.
+- Branch: `celld-os/rpc`.  Do not merge celld `main` into it; take upstream
+  release tags through an `upstream-sync/vX.Y.Z` branch, merge-first, and never
+  force-push.  See [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md).
 - One atomic commit per concern (capabilities, streams, facets/script loader,
   durable restore, cancellation, rolling compatibility, secrets,
   observability, docs).  A commit must build and pass its tests on its own.
@@ -18,17 +20,30 @@ release**, not as a merge of unrelated history.
   filenames for long facet keys) in the same commit; do not put test data or
   credentials under it.
 
-## Rebase / upgrade procedure
+## Release candidates and tags
 
-1. Fetch the target celld release/tag; rebase the patch series on it (not a
-   merge).
+Fork candidates use an annotated `v<upstream>-celld.<n>` tag (for example
+`v0.6.4-celld.1`), so a fork tag never collides with an upstream `vX.Y.Z`.
+Upstream tags and earlier fork tags are immutable; cut `-celld.N+1` instead of
+moving one. Current: **`v0.6.3-celld.1`** (object
+`f846c3b3feac448820a7f79f77886aa80c07a129`, target `8e13f09`) over upstream
+`v0.6.3` (`8702f6d`), merge `8ed6bcf`. The pre-sync `v0.6.3-rc.1` (`1120c81`)
+stays as cut. Push `candidate` at the RC commit to build the draft; publishing
+is separate.
+
+## Upstream upgrade procedure
+
+1. Fetch the target celld release tag and merge it into an
+   `upstream-sync/vX.Y.Z` branch (merge-first; a rebase only on an unshared
+   branch with mechanical conflicts).  The full procedure is
+   [UPSTREAM-SYNC.md](UPSTREAM-SYNC.md).
 2. Resolve against the RPC/JS harness, storage and protocol changes first;
    keep each patch's tests with the patch.
 3. Run locally/CI: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace`, the `two-node` job, the `secrets` job, and the
    celld-os E2E (the manager owns the latter).
-4. If a rebase changes the capability token layout, the manifest required
+4. If a sync changes the capability token layout, the manifest required
    features or the wire protocol, update `docs/rolling-deploy.md` and the
    mixed-version script **in the same patch**: old nodes must fail typed, never
    silently lose a fence.

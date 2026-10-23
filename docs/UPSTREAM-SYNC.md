@@ -26,6 +26,10 @@ upstream tag, and an existing fork tag is immutable. Use a celld suffix:
   opens the **draft** release. Publishing is a separate human step.
 
 `v0.6.3-rc.1` already exists at `1120c81` and must not be moved or reused.
+The current fork candidate is **`v0.6.3-celld.1`** (annotated, object
+`f846c3b3feac448820a7f79f77886aa80c07a129`) at
+`8e13f09355838ca58c6b8ee48b8c1355c5a49d3b`, over upstream `v0.6.3`
+(`8702f6d`) with merge `8ed6bcf`.
 
 ## Procedure
 
@@ -133,4 +137,4 @@ upstream tag, and an existing fork tag is immutable. Use a celld suffix:
 
 | date | upstream | upstream commit | sync base | merge | conflicts | gates | candidate |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-10-23 | `v0.6.3` | `8702f6d` | `90b4301` | `8ed6bcf` | none | fmt, workspace clippy, workspace tests, `dynamic_worker_tails` PASS, two-node PASS, secrets PASS (fresh bucket) | existing `v0.6.3-rc.1` (`1120c81`) untouched; no new tag |
+| 2026-10-23 | `v0.6.3` | `8702f6d` | `90b4301` | `8ed6bcf` | none | fmt, workspace clippy, workspace tests, `dynamic_worker_tails` PASS, two-node PASS, secrets PASS (fresh bucket) | `v0.6.3-celld.1` (object `f846c3b` → `8e13f09`); `v0.6.3-rc.1` untouched |
