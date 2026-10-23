@@ -23,10 +23,14 @@ carries the console output, exceptions, and outcome.
   release workflow creates the draft `v0.6.3` tag at that commit; this page
   does not pin its own hash.
 - Gates: `cargo fmt --check`; `cargo test -p celld` (47 unit tests plus the
-  `dev_profile` and `dynamic_worker_tails` integration tests). The tails test
-  loads a Dynamic Worker, calls `verify()` and `run()` over RPC, and asserts
-  the caller receives `rpcMethod=run` with `hello from executeCode 42`, the
-  object log line, and the `verify` event.
+  `dev_profile` and `dynamic_worker_tails` integration tests);
+  `cargo clippy --workspace --all-targets -- -D warnings`, which the release
+  container runs. Three pre-existing lint sites (`tokio::select!` in the
+  WebSocket frame merge and two `nonminimal_bool` expressions) were repaired
+  so the candidate image builds. The tails test loads a Dynamic Worker, calls
+  `verify()` and `run()` over RPC, and asserts the caller receives
+  `rpcMethod=run` with `hello from executeCode 42`, the object log line, and
+  the `verify` event.
 
 The full runtime history and the candidate branch are the authoritative
 release record; this page records only what the candidate changed.
