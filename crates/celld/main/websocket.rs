@@ -945,7 +945,7 @@ async fn worker_websocket_task<S>(
     let (merged_tx, mut outputs) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
-            tokio::select! {
+            celld::asyncrt::select! {
                 Some(frame) = backend_rx.recv() => { if merged_tx.send(frame).is_err() { break; } }
                 Some(frame) = caller_rx.recv() => { if merged_tx.send(frame).is_err() { break; } }
                 else => break,
