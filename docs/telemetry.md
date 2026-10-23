@@ -142,6 +142,19 @@ overhead while the dev session runs. The JavaScript-visible clocks
 Open a profile in Chrome DevTools' Performance panel, `speedscope`, or any
 `.cpuprofile` viewer.
 
+## Tail Worker events
+
+A Dynamic Worker's `WorkerCode.tails` Fetchers receive one event per
+invocation, including an **entrypoint RPC** since
+`cff193c9e085fc6c81f038bbad717bea0d703fa3`
+(`fix(loader): deliver Tail Worker events for entrypoint RPC`). This event is
+not a span or a metric and never enters the telemetry bucket: it goes to the
+caller's Tail Worker. A fetch event carries `request`/`response`; an RPC event
+carries `event.rpcMethod`, so a caller can ignore a `verify()` probe. Both
+carry the console logs, the uncaught exception, and the outcome. There is no
+HTTP endpoint and no upload. See
+[services/dynamic-workers.md](services/dynamic-workers.md).
+
 ## Query the bucket with DuckDB
 
 ```sql
