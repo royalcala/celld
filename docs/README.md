@@ -542,6 +542,12 @@ release, so keep operator tooling and celld releases together.
   failure on the owner of a forwarded Durable Object fetch can reach the
   caller as a 500 response. A v0.6.2 pair rejects the caller's `stub.fetch()`
   instead, as a local owner does. A rollback to v0.6.1 can also roll.
+- **v0.6.2 to v0.6.3: rolling.** A v0.6.3 node no longer trusts the
+  emSign ECC Root CA - G3 certificate or the eight compromised eMudhra
+  intermediate CA certificates for outbound TLS, so upgrade each node
+  promptly. Until every node runs v0.6.3, a v0.6.2 node can still acquire a
+  cell whose ownership record was lost and start the cell with an empty
+  database. A rollback to v0.6.2 can also roll.
 
 ## Diagnose a fleet
 
