@@ -3382,10 +3382,29 @@ __celld.__makeLoader = () => {
           throw new Error(
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
-        const { id } = await loadPromise;
-        return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false),
-            propsSc, limitsJson));
+        const { id, tails } = await loadPromise;
+        const loaded = __loader_rpc(
+          id, entrypoint, path[0], __rpcOut(args, false), propsSc, limitsJson,
+          tails.length !== 0);
+        const dispatch = tails.length === 0 ? loaded : loaded[0];
+        if (tails.length !== 0) {
+          // RPC calls report tails exactly as fetch does. The product's code
+          // mode tail observes `run()` and ignores its `verify()` probe, so
+          // both calls carry the report.
+          const delivery = loaded[1]
+            .then((report) => JSON.parse(report))
+            .then((events) => Promise.allSettled(
+              tails.map((tail) => tail.tail(events))))
+            .then((results) => {
+              for (const result of results) {
+                if (result.status === "rejected")
+                  console.error("Tail Worker failed:", result.reason);
+              }
+            })
+            .catch((error) => console.error("Tail delivery failed:", error));
+          __registerWaitUntil(delivery);
+        }
+        return __rpcDes(await dispatch);
       })(),
     };
     return new Proxy(target, {

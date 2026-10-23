@@ -108,9 +108,13 @@ compiles the code again.
   `props` value can be at most 1 MiB.
 - A `globalOutbound` Fetcher cannot use `connect()` or a WebSocket.
 - A `WorkerCode.tails` array accepts Service Binding Fetchers. Each Fetcher
-  receives one event after a Dynamic Worker fetch invocation finishes.
-- The event contains the request metadata, the response status, the console
-  logs, the uncaught exception, and the invocation outcome.
+  receives one event after a Dynamic Worker fetch or entrypoint RPC invocation
+  finishes.
+- The event contains the request metadata and response status for a fetch, or
+  `rpcMethod` for an entrypoint RPC, plus the console logs, the uncaught
+  exception, and the invocation outcome. This is what lets a caller that runs
+  user code over RPC (for example a code-execution tool) collect its output
+  instead of waiting for logs that never arrive.
 - celld records at most 256 KiB of serialized console log records for each
   invocation. It stops recording when the next complete record exceeds this
   limit.
