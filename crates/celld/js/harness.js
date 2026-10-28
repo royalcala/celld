@@ -219,10 +219,20 @@ class CelldHttpBodyStream extends ReadableStream {
       type: "bytes",
       async pull(controller) {
         // A chunk arrives as a Uint8Array. The host moves it in without
-        // a copy. The end of the stream arrives as a string.
-        const chunk = await __http_stream_read(id);
-        if (typeof chunk === "string") controller.close();
-        else controller.enqueue(chunk);
+        // a copy. The end of the stream arrives as a string. The host may
+        // deliver an empty chunk (for example at an HTTP/2 end-of-body
+        // boundary); byte stream controllers reject empty views, so skip it
+        // and keep pulling.
+        for (;;) {
+          const chunk = await __http_stream_read(id);
+          if (typeof chunk === "string") {
+            controller.close();
+            return;
+          }
+          if (chunk.byteLength === 0) continue;
+          controller.enqueue(chunk);
+          return;
+        }
       },
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
@@ -6005,9 +6015,16 @@ const __attachResponseRequestCancellation = (
   const reader = response.body.getReader();
   response.body = new ReadableStream({
     async pull(controller) {
-      const result = await reader.read();
-      if (result.done) controller.close();
-      else controller.enqueue(result.value);
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) {
+          controller.close();
+          return;
+        }
+        if (result.value.byteLength === 0) continue;
+        controller.enqueue(result.value);
+        return;
+      }
     },
     async cancel() {
       const reason = new Error("The client has disconnected");
