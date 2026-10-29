@@ -1,0 +1,10 @@
+# Local/machine Command Code state. Keep project knowledge (taste/ and skills/) in git.
+settings.json
+settings.local.json
+sessions/
+logs/
+cache/
+history.jsonl
+auth.json
+*.local.json
+*.tmp
