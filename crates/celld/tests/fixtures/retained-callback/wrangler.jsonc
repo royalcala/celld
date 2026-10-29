@@ -1,0 +1,8 @@
+{
+  "name": "retained-callback",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["allow_irrevocable_stub_storage"],
+  "durable_objects": { "bindings": [{ "name": "DO", "class_name": "RetainedCallback" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RetainedCallback"] }]
+}

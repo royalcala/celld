@@ -4590,6 +4590,21 @@ const __rpcSignalRefresh = () => {
       __rpcSignalReceivers.set(id, live);
   }
 };
+// A callable or RpcTarget can own a reference of its own: Cap'n Web's stubs do, and they release
+// the caller's copy once the call completes. The entry therefore holds a `dup()` of such a value,
+// so a receiver that keeps the capability past the call (a subscription callback) still has a
+// live stub. The duplicate is released with the entry, through its own `[Symbol.dispose]`.
+const __stubRetain = (value) => {
+  if (typeof value.dup !== "function") return value;
+  try {
+    const duplicate = value.dup();
+    if (typeof duplicate === "function" || duplicate instanceof __cf.RpcTarget)
+      return duplicate;
+  } catch {
+    // Not a stub, or its dup() refused: hold the value itself.
+  }
+  return value;
+};
 // Replace stub-able values with wire markers. Runs only after a
 // plain clone failed, so plain-data serialization never pays for
 // it. Passing an existing stub transfers its reference: the
@@ -4704,13 +4719,14 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       lifted = true;
       caps = true;
-      const entry = __newEntry(v);
+      const retained = __stubRetain(v);
+      const entry = __newEntry(retained);
       const marker = {
         "__celld$cap": __cap_mint(
           entry.scope !== undefined ? 1 : 2,
           entry.scope ?? "",
           entry.id,
-          typeof v === "function" ? 1 : 0,
+          typeof retained === "function" ? 1 : 0,
         ),
       };
       seen.set(v, marker);
