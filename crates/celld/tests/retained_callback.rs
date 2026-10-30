@@ -215,6 +215,16 @@ fn retained_callback_survives_the_callers_release() {
         }
         // A receiver that calls the callback *inside* the call that delivered it must reach it:
         // a subscription's streamGeneration and replay happen that way.
+        // A session capability has no durable identity: the runtime refuses to persist it, so a
+        // Durable Object cannot keep a subscriber across a restore by storing the stub.
+        let persisted = response_body(&http_get(port, "/persist")?);
+        if !(persisted.starts_with("refused:")
+            && persisted.contains("only store stubs with durable identity"))
+        {
+            return Err(std::io::Error::other(format!(
+                "session capability storage was not refused as expected: {persisted}")));
+        }
+
         let during = response_body(&http_get(port, "/during")?);
         if during != "during:during" {
             return Err(std::io::Error::other(format!(

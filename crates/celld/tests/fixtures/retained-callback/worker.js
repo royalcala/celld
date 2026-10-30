@@ -50,6 +50,16 @@ export class RetainedCallback extends DurableObject {
     return "retained";
   }
 
+
+  async persist(callback) {
+    try {
+      await this.ctx.storage.put("cb", callback);
+      return "stored";
+    } catch (error) {
+      return "refused:" + String(error);
+    }
+  }
+
   async alarm() {
     if (this.callback === null) {
       this.outcome = "err:no retained callback";
@@ -96,7 +106,17 @@ export default {
       callback[Symbol.dispose]();
       return new Response("started");
     }
-    if (url.pathname === "/during") {
+    if (url.pathname === "/persist") {
+      const hook = { refs: 1, reports: [] };
+      hooks.set(nextHook, hook);
+      const callback = new Callback(hook);
+      nextHook += 1;
+      const result = await cell().persist(callback);
+      callback[Symbol.dispose]();
+      return new Response(result);
+  }
+
+  if (url.pathname === "/during") {
       const hook = { refs: 1, reports: [] };
       hooks.set(nextHook, hook);
       const callback = new Callback(hook);
