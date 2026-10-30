@@ -63,6 +63,14 @@ export class RetainedCallback extends DurableObject {
     }
   }
 
+  // Re-entrant: the receiver calls the callback while the call that delivered it is still being
+  // served. This is what a subscription does (streamGeneration and the initial replay happen
+  // inside subscribeToChat), and it is the case that a session-level repair depends on.
+  async during(callback) {
+    this.callback = callback.dup();
+    return "during:" + await this.callback.report("during");
+  }
+
   async result() {
     return this.outcome;
   }
@@ -71,6 +79,8 @@ export class RetainedCallback extends DurableObject {
     return new Lease();
   }
 }
+
+let session = null;
 
 export default {
   async fetch(request, env) {
@@ -86,6 +96,15 @@ export default {
       callback[Symbol.dispose]();
       return new Response("started");
     }
+    if (url.pathname === "/during") {
+      const hook = { refs: 1, reports: [] };
+      hooks.set(nextHook, hook);
+      const callback = new Callback(hook);
+      nextHook += 1;
+      const outcome = await cell().during(callback);
+      callback[Symbol.dispose]();
+      return new Response(String(outcome));
+    }
     if (url.pathname === "/result") return new Response(String(await cell().result()));
     if (url.pathname === "/lease") {
       const lease = await cell().lease();
@@ -98,6 +117,24 @@ export default {
       const pair = new WebSocketPair();
       const [client, socket] = Object.values(pair);
       socket.accept();
+      session = socket;
+      // The production shape: the caller is a WebSocket message handler that is awaiting the
+      // Durable Object call when the object calls back into this isolate.
+      socket.addEventListener("message", (event) => {
+        void (async () => {
+          try {
+            const hook = { refs: 1, reports: [] };
+            hooks.set(nextHook, hook);
+            const callback = new Callback(hook);
+            nextHook += 1;
+            const outcome = await cell().during(callback);
+            callback[Symbol.dispose]();
+            socket.send("result:" + outcome);
+          } catch (error) {
+            socket.send("error:" + String(error?.message ?? error));
+          }
+        })();
+      });
       return new Response(null, { status: 101, webSocket: client });
     }
     return new Response("not found", { status: 404 });

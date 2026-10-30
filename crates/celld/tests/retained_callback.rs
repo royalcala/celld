@@ -122,6 +122,34 @@ fn connect_websocket(port: u16) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
+/// Sends one masked text frame and returns the first text frame the server sends back.
+fn ws_client_text(stream: &mut TcpStream, text: &str) -> std::io::Result<String> {
+    let payload = text.as_bytes();
+    let mask = [0x11u8, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x81u8];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    stream.write_all(&frame)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header)?;
+    let mut length = (header[1] & 0x7f) as usize;
+    if length == 126 {
+        let mut extended = [0u8; 2];
+        stream.read_exact(&mut extended)?;
+        length = u16::from_be_bytes(extended) as usize;
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 #[test]
 fn retained_callback_survives_the_callers_release() {
     if Command::new("esbuild").arg("--version").output().is_err() {
@@ -184,6 +212,21 @@ fn retained_callback_survives_the_callers_release() {
         if lease != "true" {
             return Err(std::io::Error::other(format!(
                 "returned RpcTarget method failed: {lease:?}")));
+        }
+        // A receiver that calls the callback *inside* the call that delivered it must reach it:
+        // a subscription's streamGeneration and replay happen that way.
+        let during = response_body(&http_get(port, "/during")?);
+        if during != "during:during" {
+            return Err(std::io::Error::other(format!(
+                "re-entrant callback failed from a fetch: {during:?}")));
+        }
+        // Same, from a WebSocket message handler that is awaiting the object's reply -- the shape a
+        // session's subscribe call takes.
+        let mut socket = connect_websocket(port)?;
+        let frame = ws_client_text(&mut socket, "during")?;
+        if frame != "result:during:during" {
+            return Err(std::io::Error::other(format!(
+                "re-entrant callback failed from a websocket message: {frame:?}")));
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut outcome = String::new();
