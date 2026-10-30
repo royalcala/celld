@@ -30,6 +30,12 @@ class Callback extends RpcTarget {
   }
 }
 
+class Lease extends RpcTarget {
+  alive() {
+    return "true";
+  }
+}
+
 export class RetainedCallback extends DurableObject {
   constructor(ctx) {
     super(ctx);
@@ -60,6 +66,10 @@ export class RetainedCallback extends DurableObject {
   async result() {
     return this.outcome;
   }
+
+  async lease() {
+    return new Lease();
+  }
 }
 
 export default {
@@ -77,6 +87,10 @@ export default {
       return new Response("started");
     }
     if (url.pathname === "/result") return new Response(String(await cell().result()));
+    if (url.pathname === "/lease") {
+      const lease = await cell().lease();
+      return new Response(String(await lease.alive()));
+    }
     if (url.pathname === "/socket") {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("websocket upgrade required", { status: 426 });

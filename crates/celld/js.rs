@@ -9469,6 +9469,28 @@ fn capability_refs() -> &'static Mutex<CapabilityRefs> {
 /// Stateless isolates that exported a capability, by host heap id. Weak, so a
 /// marker cannot keep a retired isolate alive; a call to one that is gone
 /// fails instead.
+/// The shell's dialer for a stateless capability owned by another node. It is
+/// installed once at startup: the runtime decides *that* a call must cross
+/// nodes, the shell owns how a peer is reached.
+pub type CapabilityForwarder = std::sync::Arc<
+    dyn Fn(
+            String,
+            String,
+            String,
+            Option<Vec<String>>,
+            Option<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+static CAPABILITY_FORWARDER: OnceLock<CapabilityForwarder> = OnceLock::new();
+
+/// Installs the cross-node dialer for stateless capabilities.
+pub fn install_capability_forwarder(forwarder: CapabilityForwarder) {
+    let _ = CAPABILITY_FORWARDER.set(forwarder);
+}
+
 static STUB_OWNER_SLOTS: OnceLock<
     Mutex<std::collections::HashMap<String, Weak<crate::pool::Slot>>>,
 > = OnceLock::new();
@@ -9549,6 +9571,11 @@ fn op_cap_mint(
             String::new()
         },
         node: crate::capability::own_node().to_string(),
+        addr: if kind == CapabilityKind::Stateless {
+            crate::capability::own_advertise().to_string()
+        } else {
+            String::new()
+        },
         generation: crate::capability::generation_for(&heap),
         handle,
         flags,
@@ -9633,6 +9660,61 @@ fn op_cap_check(
         return;
     }
     rv.set(v8::Boolean::new(scope, true).into());
+}
+
+/// Verifies a capability token that arrived from another node.
+pub fn verify_remote_capability(token: &str) -> Result<CapabilityClaims, String> {
+    let (claims, legacy) = capability_key()
+        .verify_compat(token)
+        .map_err(|error| error.to_string())?;
+    if !crate::capability::legacy_is_safe(legacy, claims.flags) {
+        return Err("legacy transient capability has no cross-node fence".to_owned());
+    }
+    Ok(claims)
+}
+
+/// Runs one capability call on the node that owns the target, re-checking the
+/// caller's token against this process's incarnation before touching a handle.
+pub async fn run_forwarded_stub_rpc(
+    claims: &CapabilityClaims,
+    path: Option<Vec<String>>,
+    args: Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    if claims.kind != CapabilityKind::Stateless {
+        return Err("only a stateless capability crosses nodes".to_owned());
+    }
+    let own = crate::capability::own_node();
+    if claims.node.is_empty() || own.is_empty() || claims.node != own {
+        return Err("capability belongs to another node".to_owned());
+    }
+    if claims.generation != crate::capability::generation_for(&claims.owner) {
+        return Err("capability belongs to a retired isolate incarnation".to_owned());
+    }
+    let slot = stub_owner_slot(&claims.owner).ok_or_else(|| {
+        "RPC target's isolate is gone, or is on another celld node.".to_owned()
+    })?;
+    // Affiliate before checking, so the pool cannot free the isolate between
+    // the check and the drive; held until the call is done.
+    let _hold = slot.affiliate();
+    if slot.is_retiring() {
+        return Err("RPC target's isolate is gone, or is on another celld node.".to_owned());
+    }
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let job = crate::WorkerJob::StubRpc {
+        id: claims.handle,
+        path,
+        args,
+        reply,
+    };
+    let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+    match receive.await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => match driving.await {
+            Err(error) => Err(error.to_string()),
+            Ok(()) => Err("stub RPC ended without a reply".to_owned()),
+        },
+    }
 }
 
 /// Starts a bounded host span for the JS `tracing` API.
@@ -9759,11 +9841,15 @@ fn enqueue_stub_rpc(
 fn enqueue_stub_rpc_stateless(
     scope: &mut v8::PinScope,
     claims: &CapabilityClaims,
+    token: &str,
     path: Option<Vec<String>>,
     args: Option<Vec<u8>>,
 ) -> u64 {
     let owner = claims.owner.clone();
     let handle = claims.handle;
+    let node = claims.node.clone();
+    let addr = claims.addr.clone();
+    let token = token.to_owned();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     asyncrt::enqueue(async move {
         let gone = || {
@@ -9775,6 +9861,28 @@ fn enqueue_stub_rpc_stateless(
         await_egress_gate(gate)
             .await
             .map_err(|error| rpc_error("transport", error))?;
+        // The owner is another node: hand the call to the shell, which dials
+        // the peer carried in the token. The receiver re-checks the fence
+        // against its own incarnation before running it.
+        let own = crate::capability::own_node();
+        if !node.is_empty() && !own.is_empty() && node != own {
+            let Some(forward) = CAPABILITY_FORWARDER.get() else {
+                return Err(rpc_error(
+                    "owner-moved",
+                    "this node has no cross-node capability dialer",
+                ));
+            };
+            if addr.is_empty() {
+                return Err(rpc_error(
+                    "owner-moved",
+                    "stateless capability predates owner addresses",
+                ));
+            }
+            return match (forward)(node, addr, token, path, args).await {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => Err(rpc_error("owner-moved", error)),
+            };
+        }
         let slot = stub_owner_slot(&owner).ok_or_else(gone)?;
         // Affiliate before checking, so the pool cannot free the isolate
         // between the check and the drive; held until the call is done.
@@ -9854,7 +9962,7 @@ fn op_cap_release(
                 let _ = enqueue_stub_rpc(scope, &claims, &token, "null", bytes::Bytes::new());
             }
             CapabilityKind::Stateless => {
-                let _ = enqueue_stub_rpc_stateless(scope, &claims, None, None);
+                let _ = enqueue_stub_rpc_stateless(scope, &claims, &token, None, None);
             }
             _ => {}
         }
@@ -9911,20 +10019,11 @@ fn op_stub_rpc_call_token(
             rv.set(promise_for(scope, id));
         }
         CapabilityKind::Stateless => {
-            let own = crate::capability::own_node();
-            if !claims.node.is_empty() && !own.is_empty() && claims.node != own {
-                loader_throw_typed(
-                    scope,
-                    "owner-moved",
-                    "stateless capability is node-local and belongs to another node",
-                );
-                return;
-            }
             let Ok(path) = serde_json::from_str::<Option<Vec<String>>>(&path) else {
                 loader_throw_typed(scope, "forbidden", "capability path is not valid JSON");
                 return;
             };
-            let id = enqueue_stub_rpc_stateless(scope, &claims, path, args_bytes);
+            let id = enqueue_stub_rpc_stateless(scope, &claims, &token, path, args_bytes);
             rv.set(promise_for(scope, id));
         }
         _ => loader_throw_typed(
@@ -9972,6 +10071,7 @@ fn op_restore_mint(
         owner: owner.clone(),
         route: String::new(),
         node: String::new(),
+        addr: String::new(),
         generation: 0,
         handle,
         flags: if facet {

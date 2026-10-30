@@ -3878,6 +3878,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let node = std::env::var("CELLD_NODE").unwrap_or_else(|_| random_node_session_id());
     // Capability tokens carry this process's node and incarnation.
     celld::capability::set_identity(&node);
+    celld::capability::set_advertise(&advertise);
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;
@@ -4369,6 +4370,38 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
+
+    // A stateless capability whose owner is another node crosses the peer
+    // plane: the runtime hands the call and its token here, and this dials the
+    // address the token carries. The receiver re-checks the fence.
+    let forward_http = app.peer_http.clone();
+    let forward_auth = app.peer_auth.clone();
+    celld::js::install_capability_forwarder(std::sync::Arc::new(
+        move |node, addr, token, path, args| {
+        let http = forward_http.clone();
+        let auth = forward_auth.clone();
+        Box::pin(async move {
+            let peer = peer_tunnel::Peer {
+                http: &http,
+                auth: &auth,
+                addr: &addr,
+                node: &node,
+            };
+            let response = peer_tunnel::cap(&peer, &token, &path, args, None).await?;
+            let status = response.status();
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .map_err(|error| anyhow::anyhow!("read capability reply: {error}"))?
+                .to_bytes();
+            if status != hyper::StatusCode::OK {
+                anyhow::bail!(
+                    "capability call rejected by {addr}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            Ok(body.to_vec())
+        })
+    }));
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a

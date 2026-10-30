@@ -24,6 +24,7 @@ use std::fmt;
 type HmacSha256 = Hmac<Sha256>;
 
 static OWN_NODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static OWN_ADVERTISE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static INCARNATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Installs this process's fleet identity before any isolate mints a token.
@@ -34,6 +35,18 @@ pub fn set_identity(node: &str) {
     let mut bytes = [0u8; 8];
     let _ = getrandom::fill(&mut bytes);
     let _ = INCARNATION.set(u64::from_le_bytes(bytes));
+}
+
+/// Installs the address peers dial for this process. A stateless capability
+/// carries it so its owner can be reached from another node without a
+/// registry read on the call path.
+pub fn set_advertise(advertise: &str) {
+    let _ = OWN_ADVERTISE.set(advertise.to_owned());
+}
+
+/// The address peers dial for this process (empty in tests).
+pub fn own_advertise() -> &'static str {
+    OWN_ADVERTISE.get().map(String::as_str).unwrap_or("")
 }
 
 /// The node that minted this process's tokens (empty in tests).
@@ -54,7 +67,11 @@ pub fn generation_for(heap: &str) -> u64 {
 }
 
 /// Bumped only when the token layout changes.
-const TOKEN_VERSION: u8 = 2;
+const TOKEN_VERSION: u8 = 3;
+/// Version 2 predates the owner address. A rolling deploy can still meet one,
+/// so it parses (with no address) and only loses the cross-node stateless
+/// call, which fails typed as before.
+const LEGACY_VERSION_NO_ADDR: u8 = 2;
 /// Bit 0 is the caller-visible "callable target" marker set by `__cap_mint`.
 pub const FLAG_CALLABLE: u8 = 0b01;
 /// Bit 1 names a handle that is a row of the owner's persistent-stub table, so
@@ -71,6 +88,7 @@ const MAC_DOMAIN: &[u8] = b"celld-capability-token-v1";
 const MAC_LEN: usize = 32;
 const MAX_OWNER_LEN: usize = 512;
 const MAX_NODE_LEN: usize = 256;
+const MAX_ADDR_LEN: usize = 256;
 const MAX_TOKEN_LEN: usize = 8 * 1024;
 
 /// What owns the target a capability points at.
@@ -117,6 +135,10 @@ pub struct CapabilityClaims {
     pub route: String,
     /// Node that owns the target. Empty only for tests.
     pub node: String,
+    /// Address peers dial for that node, so a stateless capability can be
+    /// called from another node without a registry read. Empty for cell
+    /// handles (their route names the owner) and for legacy tokens.
+    pub addr: String,
     /// Owner incarnation. A token from an older incarnation is stale.
     pub generation: u64,
     /// Handle id within the owner.
@@ -138,6 +160,7 @@ impl CapabilityClaims {
             owner: owner.into(),
             route: String::new(),
             node: node.into(),
+            addr: String::new(),
             generation,
             handle,
             flags: 0,
@@ -271,7 +294,9 @@ impl CapabilityKey {
     pub fn verify_compat(&self, token: &str) -> Result<(CapabilityClaims, bool), CapabilityError> {
         let payload = self.verified_payload(token)?;
         match payload.first().copied() {
-            Some(TOKEN_VERSION) => parse_claims(&payload).map(|claims| (claims, false)),
+            Some(TOKEN_VERSION) | Some(LEGACY_VERSION_NO_ADDR) => {
+                parse_claims(&payload).map(|claims| (claims, false))
+            }
             Some(1) => parse_claims_v1(&payload).map(|claims| (claims, true)),
             Some(version) => Err(CapabilityError::UnknownVersion(version)),
             None => Err(CapabilityError::Malformed),
@@ -310,18 +335,24 @@ fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> 
     let owner = claims.owner.as_bytes();
     let route = claims.route.as_bytes();
     let node = claims.node.as_bytes();
+    let addr = claims.addr.as_bytes();
     if owner.len() > MAX_OWNER_LEN {
         return Err(CapabilityError::OwnerTooLong);
     }
     if node.len() > MAX_NODE_LEN {
         return Err(CapabilityError::NodeTooLong);
     }
+    if addr.len() > MAX_ADDR_LEN {
+        return Err(CapabilityError::NodeTooLong);
+    }
     let owner_len = u16::try_from(owner.len()).map_err(|_| CapabilityError::OwnerTooLong)?;
     let node_len = u16::try_from(node.len()).map_err(|_| CapabilityError::NodeTooLong)?;
     let route_len = u16::try_from(route.len()).map_err(|_| CapabilityError::OwnerTooLong)?;
+    let addr_len = u16::try_from(addr.len()).map_err(|_| CapabilityError::NodeTooLong)?;
 
-    let mut payload =
-        Vec::with_capacity(1 + 1 + 1 + 8 + 8 + 2 + owner.len() + 2 + node.len() + 2 + route.len());
+    let mut payload = Vec::with_capacity(
+        1 + 1 + 1 + 8 + 8 + 2 + owner.len() + 2 + node.len() + 2 + route.len() + 2 + addr.len(),
+    );
     payload.push(TOKEN_VERSION);
     payload.push(claims.kind.as_u8());
     payload.push(claims.flags);
@@ -333,13 +364,15 @@ fn encode_claims(claims: &CapabilityClaims) -> Result<Vec<u8>, CapabilityError> 
     payload.extend_from_slice(node);
     payload.extend_from_slice(&route_len.to_le_bytes());
     payload.extend_from_slice(route);
+    payload.extend_from_slice(&addr_len.to_le_bytes());
+    payload.extend_from_slice(addr);
     Ok(payload)
 }
 
 fn parse_claims(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
     let mut cursor = 0_usize;
     let version = take_u8(payload, &mut cursor)?;
-    if version != TOKEN_VERSION {
+    if version != TOKEN_VERSION && version != LEGACY_VERSION_NO_ADDR {
         return Err(CapabilityError::UnknownVersion(version));
     }
     let kind = CapabilityKind::from_u8(take_u8(payload, &mut cursor)?)?;
@@ -349,6 +382,11 @@ fn parse_claims(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
     let owner = take_string(payload, &mut cursor, MAX_OWNER_LEN)?;
     let node = take_string(payload, &mut cursor, MAX_NODE_LEN)?;
     let route = take_string(payload, &mut cursor, MAX_OWNER_LEN)?;
+    let addr = if version >= TOKEN_VERSION {
+        take_string(payload, &mut cursor, MAX_ADDR_LEN)?
+    } else {
+        String::new()
+    };
     if cursor != payload.len() {
         return Err(CapabilityError::Malformed);
     }
@@ -357,6 +395,7 @@ fn parse_claims(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> {
         owner,
         route,
         node,
+        addr,
         generation,
         handle,
         flags,
@@ -382,6 +421,7 @@ fn parse_claims_v1(payload: &[u8]) -> Result<CapabilityClaims, CapabilityError> 
         owner,
         route: String::new(),
         node,
+        addr: String::new(),
         generation,
         handle,
         flags,
@@ -571,6 +611,7 @@ mod tests {
             owner: "OverseerDurableObject:abc".to_owned(),
             route: String::new(),
             node: "node-a".to_owned(),
+            addr: "10.0.0.1:9999".to_owned(),
             generation: 42,
             handle: 9,
             flags: 0,

@@ -179,6 +179,12 @@ fn retained_callback_survives_the_callers_release() {
                 started.lines().next().unwrap_or_default()
             )));
         }
+        // A returned RpcTarget must answer its prototype methods.
+        let lease = response_body(&http_get(port, "/lease")?);
+        if lease != "true" {
+            return Err(std::io::Error::other(format!(
+                "returned RpcTarget method failed: {lease:?}")));
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut outcome = String::new();
         while Instant::now() < deadline {

@@ -54,6 +54,10 @@ const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER
 enum TunnelKind {
     Do,
     Rpc,
+    /// A capability call whose target lives in a stateless isolate on this
+    /// node. Its token rides a header and the receiver re-checks it against
+    /// its own incarnation before running it.
+    Cap,
 }
 
 /// The control fields of one tunneled call, carried as inner-request headers
@@ -121,6 +125,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
     {
         Some(b"do") => TunnelKind::Do,
         Some(b"rpc") => TunnelKind::Rpc,
+        Some(b"cap") => TunnelKind::Cap,
         _ => {
             return peer_response(response(StatusCode::BAD_REQUEST, "unknown tunnel kind"));
         }
@@ -134,6 +139,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
         match kind {
             TunnelKind::Do => serve_do(upgraded, app).await,
             TunnelKind::Rpc => serve_rpc(upgraded, app).await,
+            TunnelKind::Cap => serve_cap(upgraded, app).await,
         }
     });
     let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
@@ -541,6 +547,8 @@ pub(crate) async fn fetch(
 }
 
 pub(crate) const METHOD_HEADER: &str = "x-cells-rpc-method";
+/// The capability token a cross-node capability call arrived under.
+pub(crate) const CAPABILITY_HEADER: &str = "x-cells-capability";
 
 /// One inner request, one RPC: the method name rides a header, the
 /// arguments ride the body, and the content type says which encoding the
@@ -610,6 +618,96 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(upgraded, service)
         .await;
+}
+
+/// Node B: run a capability call owned here for a caller on another node.
+async fn serve_cap(upgraded: hyper::upgrade::Upgraded, _app: AppHandle) {
+    let service = service_fn(move |inner: Request<Incoming>| async move {
+        let token = inner
+            .headers()
+            .get(CAPABILITY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let Some(token) = token else {
+            return Ok::<_, Infallible>(peer_response(response(
+                StatusCode::BAD_REQUEST,
+                "capability header is missing",
+            )));
+        };
+        let Some(path) = inner
+            .headers()
+            .get(METHOD_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+        else {
+            return Ok::<_, Infallible>(peer_response(response(
+                StatusCode::BAD_REQUEST,
+                "capability path header is missing",
+            )));
+        };
+        let Ok(path) = serde_json::from_str::<Option<Vec<String>>>(&path) else {
+            return Ok::<_, Infallible>(peer_response(response(
+                StatusCode::BAD_REQUEST,
+                "capability path is not valid JSON",
+            )));
+        };
+        let body = match collect_limited_body(inner.into_body(), MAX_PEER_FORWARD_BODY_BYTES).await
+        {
+            Ok(body) => body,
+            Err(error) => return Ok(peer_response(body_read_error("tunnel capability", error))),
+        };
+        let claims = match celld::js::verify_remote_capability(&token) {
+            Ok(claims) => claims,
+            Err(error) => return Ok(peer_response(response(StatusCode::FORBIDDEN, error))),
+        };
+        let args = (!body.is_empty()).then(|| body.to_vec());
+        match celld::js::run_forwarded_stub_rpc(&claims, path, args).await {
+            Ok(bytes) => Ok(peer_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(BodyExt::boxed_unsync(
+                        http_body_util::Full::new(Bytes::from(bytes))
+                            .map_err(|never| match never {}),
+                    ))
+                    .unwrap(),
+            )),
+            Err(error) => Ok(peer_response(response(StatusCode::BAD_GATEWAY, error))),
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(upgraded, service)
+        .await;
+}
+
+/// Node A: one capability call to the node that owns the target.
+pub(crate) async fn cap(
+    peer: &Peer<'_>,
+    token: &str,
+    path: &Option<Vec<String>>,
+    args: Option<Vec<u8>>,
+    request_id: Option<celld::js::RequestId>,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    let path = serde_json::to_string(path)?;
+    let payload = Bytes::from(args.unwrap_or_default());
+    send_inner(
+        peer,
+        "cap",
+        |body| {
+            let mut inner = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(CAPABILITY_HEADER, token)
+                .header(METHOD_HEADER, path.clone())
+                .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(id) = request_id {
+                inner = inner.header(REQUEST_ID_HEADER, celld::js::request_id_string(id));
+            }
+            Ok(inner.body(body)?)
+        },
+        celld::js::RequestBody::Bytes(payload),
+    )
+    .await
 }
 
 /// Node A: one RPC through the pooled rpc tunnel.

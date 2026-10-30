@@ -95,9 +95,9 @@ log "cross-node durable restore"
 [ "$(curl -s "http://127.0.0.1:$APORT/store")" = "stored" ] || fail "store durable"
 [ "$(curl -s "http://127.0.0.1:$BPORT/durable")" = "durable-value" ] || fail "durable before failover"
 
-log "stateless capability across nodes is rejected typed"
+log "stateless capability across nodes"
 STATELESS=$(curl -s "http://127.0.0.1:$BPORT/stateless")
-[ "$STATELESS" = "err:owner-moved" ] || fail "expected err:owner-moved, got $STATELESS"
+[ "$STATELESS" = "pong" ] || fail "expected pong, got $STATELESS"
 
 log "cross-node cancellation"
 curl -s --max-time 0.25 "http://127.0.0.1:$BPORT/slow" >/dev/null 2>&1 || true
