@@ -7138,6 +7138,7 @@ ops! { OP_NAMES, install_op_functions,
         "__cap_retain" => op_cap_retain,
         "__cap_release" => op_cap_release,
         "__cap_check" => op_cap_check,
+        "__cap_persist" => op_cap_persist,
         "__trace_begin" => op_trace_begin,
         "__trace_attr" => op_trace_attr,
         "__trace_end" => op_trace_end,
@@ -9479,7 +9480,8 @@ pub type CapabilityForwarder = std::sync::Arc<
             String,
             Option<Vec<String>>,
             Option<Vec<u8>>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>
         + Send
         + Sync,
 >;
@@ -9662,6 +9664,35 @@ fn op_cap_check(
     rv.set(v8::Boolean::new(scope, true).into());
 }
 
+/// `__cap_persist(token)` -> the owner node, when this capability may be
+/// written down as a token and revived later.
+///
+/// The storage rule refuses a transient stub because its entry id means nothing
+/// after a restart. It deliberately leaves one opening: the token string that
+/// identifies the same handle, which is signed by the fleet key and carries the
+/// owner's node, isolate incarnation and dial address. This op is the single
+/// place that decides whether that opening applies to a given token, so the JS
+/// surface (`capabilityToken` / `restoreCapability`) cannot offer a weaker one.
+///
+/// Liveness is *not* decided here. The owner may be on another node -- that is
+/// the case this exists for -- so whether it is still there is settled by the
+/// call itself (`owner-gone`, `owner-moved`, `stale-generation`), never by a
+/// stale check at persist time.
+fn op_cap_persist(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).to_rust_string_lossy(scope);
+    match capability_key().verify_revivable(&token) {
+        Ok(claims) => {
+            let node = v8::String::new(scope, &claims.node).unwrap();
+            rv.set(node.into());
+        }
+        Err(error) => loader_throw_typed(scope, "forbidden", &error.to_string()),
+    }
+}
+
 /// Verifies a capability token that arrived from another node.
 pub fn verify_remote_capability(token: &str) -> Result<CapabilityClaims, String> {
     let (claims, legacy) = capability_key()
@@ -9690,9 +9721,8 @@ pub async fn run_forwarded_stub_rpc(
     if claims.generation != crate::capability::generation_for(&claims.owner) {
         return Err("capability belongs to a retired isolate incarnation".to_owned());
     }
-    let slot = stub_owner_slot(&claims.owner).ok_or_else(|| {
-        "RPC target's isolate is gone, or is on another celld node.".to_owned()
-    })?;
+    let slot = stub_owner_slot(&claims.owner)
+        .ok_or_else(|| "RPC target's isolate is gone, or is on another celld node.".to_owned())?;
     // Affiliate before checking, so the pool cannot free the isolate between
     // the check and the drive; held until the call is done.
     let _hold = slot.affiliate();

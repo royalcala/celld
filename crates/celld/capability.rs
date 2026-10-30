@@ -148,6 +148,35 @@ pub struct CapabilityClaims {
 }
 
 impl CapabilityClaims {
+    /// May this capability be written down as a token and revived later?
+    ///
+    /// The storage rule refuses a transient stub because an entry id means
+    /// nothing after a restart. The token is different: it is signed by the
+    /// fleet key and names the owner's node, the owner's isolate incarnation and
+    /// the address peers dial, so a revived handle can be re-verified at call
+    /// time and refused typed once that owner is gone. Only a handle carrying
+    /// that whole fence may be persisted; anything weaker would resolve to a
+    /// reused entry after a restart instead of failing, which is exactly the
+    /// aliasing the token model exists to prevent.
+    pub fn revival_fence(&self) -> Result<(), RevivalFenceError> {
+        if self.flags & FLAG_RESTORE != 0 {
+            return Err(RevivalFenceError::DurableHandle);
+        }
+        if self.kind != CapabilityKind::Stateless {
+            return Err(RevivalFenceError::CellHandle);
+        }
+        if self.node.is_empty() {
+            return Err(RevivalFenceError::NoNode);
+        }
+        if self.generation == 0 {
+            return Err(RevivalFenceError::NoGeneration);
+        }
+        if self.addr.is_empty() {
+            return Err(RevivalFenceError::NoAddress);
+        }
+        Ok(())
+    }
+
     /// Builds claims for a cell-owned target.
     pub fn cell(
         owner: impl Into<String>,
@@ -167,6 +196,66 @@ impl CapabilityClaims {
         }
     }
 }
+
+/// Why a capability may not be persisted as a token and revived later.
+///
+/// Each variant is a different reason a restored owner would have nothing to
+/// verify against, so none of them is a policy choice the application can
+/// override: an unfenced handle stays refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevivalFenceError {
+    /// The token itself is unusable (encoding, MAC, version).
+    Token(CapabilityError),
+    /// A version 1 transient token predates the node/incarnation fence.
+    Legacy,
+    /// A durable (`ctx.restore`) handle is already persisted by its row; the
+    /// stub, not a copied token, is the thing to store.
+    DurableHandle,
+    /// A cell-owned handle lives in the isolate serving that cell, so it is
+    /// gone by the time a revived copy could be used.
+    CellHandle,
+    /// The token names no node.
+    NoNode,
+    /// The token names no isolate incarnation.
+    NoGeneration,
+    /// The token carries no owner address, so it could not be called from the
+    /// node that revived it after the object moved.
+    NoAddress,
+}
+
+impl fmt::Display for RevivalFenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Token(error) => write!(f, "{error}"),
+            Self::Legacy => write!(
+                f,
+                "legacy transient capability has no cross-node fence; drain the old node and re-acquire"
+            ),
+            Self::DurableHandle => write!(
+                f,
+                "this handle is already durable (ctx.restore): store the stub itself"
+            ),
+            Self::CellHandle => write!(
+                f,
+                "only a stateless (session) capability can be persisted: a cell handle belongs to the isolate that serves the cell"
+            ),
+            Self::NoNode => write!(
+                f,
+                "this capability names no owning node, so a restart could not tell it from a reused handle"
+            ),
+            Self::NoGeneration => write!(
+                f,
+                "this capability names no owner isolate incarnation, so a restart could not tell it from a reused handle"
+            ),
+            Self::NoAddress => write!(
+                f,
+                "this capability carries no owner address, so it could not be called after its object moves to another node"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RevivalFenceError {}
 
 /// Errors from minting, verifying or tracking a capability.
 #[derive(Debug, PartialEq, Eq)]
@@ -301,6 +390,26 @@ impl CapabilityKey {
             Some(version) => Err(CapabilityError::UnknownVersion(version)),
             None => Err(CapabilityError::Malformed),
         }
+    }
+
+    /// Verifies a token a caller wants to persist and revive later.
+    ///
+    /// This is the authoritative answer to "may I store this token?", and it
+    /// deliberately re-applies the rolling-upgrade rule: a version 1 transient
+    /// token has no fence, so it is refused here for the same reason the call
+    /// path refuses it. It does **not** check the fence against this process:
+    /// the token names another node (that is the point), and whether that owner
+    /// is still there is decided by the call, which answers `owner-gone`,
+    /// `owner-moved` or `stale-generation`.
+    pub fn verify_revivable(&self, token: &str) -> Result<CapabilityClaims, RevivalFenceError> {
+        let (claims, legacy) = self
+            .verify_compat(token)
+            .map_err(RevivalFenceError::Token)?;
+        if !legacy_is_safe(legacy, claims.flags) {
+            return Err(RevivalFenceError::Legacy);
+        }
+        claims.revival_fence()?;
+        Ok(claims)
     }
 
     fn verified_payload(&self, token: &str) -> Result<Vec<u8>, CapabilityError> {
@@ -807,6 +916,115 @@ mod tests {
         let verified = key().verify(&token).expect("verify");
         assert_eq!(verified.flags & FLAG_RESTORE, FLAG_RESTORE);
         assert_eq!(verified.flags & FLAG_CALLABLE, 0);
+    }
+
+    fn session_claims() -> CapabilityClaims {
+        CapabilityClaims {
+            kind: CapabilityKind::Stateless,
+            owner: "heap-7".to_owned(),
+            route: String::new(),
+            node: "node-a".to_owned(),
+            addr: "10.0.0.1:9999".to_owned(),
+            generation: 0x1234_5678,
+            handle: 3,
+            flags: FLAG_CALLABLE,
+        }
+    }
+
+    #[test]
+    fn a_fenced_session_capability_may_be_persisted() {
+        let key = key();
+        let token = key.mint(&session_claims()).expect("mint");
+        let claims = key.verify_revivable(&token).expect("revivable");
+        assert_eq!(claims.kind, CapabilityKind::Stateless);
+        assert_eq!(claims.node, "node-a");
+    }
+
+    /// The check is the token's shape, not this process's identity: the owner
+    /// lives on another node, and whether it still exists is decided at call
+    /// time so a dead owner answers typed instead of being pre-judged here.
+    #[test]
+    fn revival_accepts_a_foreign_owner_and_defers_liveness_to_the_call() {
+        let key = key();
+        let token = key.mint(&session_claims()).expect("mint");
+        assert_ne!(own_node(), "node-a");
+        assert!(key.verify_revivable(&token).is_ok());
+    }
+
+    #[test]
+    fn unfenced_handles_stay_refused() {
+        let key = key();
+
+        let mut cell = session_claims();
+        cell.kind = CapabilityKind::Cell;
+        cell.owner = "Chat:abc".to_owned();
+        assert_eq!(
+            key.verify_revivable(&key.mint(&cell).expect("mint")),
+            Err(RevivalFenceError::CellHandle)
+        );
+
+        let mut no_node = session_claims();
+        no_node.node = String::new();
+        assert_eq!(
+            key.verify_revivable(&key.mint(&no_node).expect("mint")),
+            Err(RevivalFenceError::NoNode)
+        );
+
+        let mut no_generation = session_claims();
+        no_generation.generation = 0;
+        assert_eq!(
+            key.verify_revivable(&key.mint(&no_generation).expect("mint")),
+            Err(RevivalFenceError::NoGeneration)
+        );
+
+        let mut no_address = session_claims();
+        no_address.addr = String::new();
+        assert_eq!(
+            key.verify_revivable(&key.mint(&no_address).expect("mint")),
+            Err(RevivalFenceError::NoAddress)
+        );
+
+        // A durable handle is already persisted by its row.
+        let mut durable = session_claims();
+        durable.flags = FLAG_RESTORE;
+        assert_eq!(
+            key.verify_revivable(&key.mint(&durable).expect("mint")),
+            Err(RevivalFenceError::DurableHandle)
+        );
+
+        // A token from another key never revives.
+        let other = CapabilityKey::new([9_u8; 32]);
+        let token = other.mint(&session_claims()).expect("mint");
+        assert_eq!(
+            key.verify_revivable(&token),
+            Err(RevivalFenceError::Token(CapabilityError::BadMac))
+        );
+        assert_eq!(
+            key.verify_revivable("not base64!"),
+            Err(RevivalFenceError::Token(CapabilityError::Malformed))
+        );
+    }
+
+    /// A version 1 transient token predates the node/incarnation fence, so the
+    /// compat window does not make it persistable: reviving it could alias a
+    /// reused handle after a restart.
+    #[test]
+    fn a_legacy_transient_token_is_not_revivable() {
+        let key = key();
+        let mut transient = session_claims();
+        transient.flags = 0;
+        let token = key.sign_payload(&v1_payload(&transient)).expect("sign");
+        assert_eq!(key.verify_revivable(&token), Err(RevivalFenceError::Legacy));
+
+        // The durable v1 path stays open, but a durable row is persisted by the
+        // row itself, so it still is not something to copy a token for.
+        let mut durable = session_claims();
+        durable.flags = FLAG_RESTORE;
+        let token = key.sign_payload(&v1_payload(&durable)).expect("sign");
+        assert_eq!(
+            key.verify_revivable(&token),
+            Err(RevivalFenceError::DurableHandle)
+        );
     }
 
     #[test]

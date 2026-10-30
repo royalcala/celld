@@ -5113,6 +5113,54 @@ const __foreignStub = (token, state, durable = false, stored = false) => {
   if (!meta.stored) __remoteStubFinalizer.register(stub, token, meta);
   return stub;
 };
+// ---- persisted capabilities -------------------------------------
+// A capability received over RPC (a browser session's callback, say) is a
+// transient handle: its entry id means nothing after a restart, which is why
+// `ctx.storage.put` refuses the stub. The *token* is what survives. It is
+// already the stub's wire form -- an HMAC over owner, node, isolate incarnation
+// and dial address -- so an application persists that string and revives the
+// handle later, when a restored Durable Object would otherwise have to ask the
+// client to subscribe again. The host re-verifies the token on every call, so a
+// revived handle whose owner is gone answers `owner-gone`, `owner-moved` or
+// `stale-generation`; it never resolves to a reused entry.
+//
+// A stored token owns one exported reference: a string has nowhere to put a
+// disposal, so deleting the row is what releases the owner's handle. That is
+// the same lifetime a `ctx.restore` row has, and the same rule a stored
+// persistent stub follows.
+const __cap_persistable = (token) => __cap_persist(token);
+// The token for a received capability, to write down and revive later.
+const capabilityToken = (value) => {
+  const remote = __remoteStubMeta.get(value);
+  if (remote === undefined)
+    throw new TypeError(
+      "capabilityToken() takes a capability received over RPC. A Durable " +
+      "Object stub or a service stub has durable identity (store the stub), " +
+      "and a local object has none.");
+  if (remote.disposed) throw __stubDisposedError();
+  if (remote.durable)
+    throw new TypeError(
+      "capabilityToken() takes a transient capability. This stub is already " +
+      "durable (ctx.restore), so store the stub itself.");
+  // The fence is the host's call: only a token naming its owner's node and
+  // isolate incarnation may be persisted at all.
+  __cap_persistable(remote.token);
+  // The row owns this reference from here on, so disposing the handle that
+  // delivered the capability cannot end the persisted one.
+  __cap_retain(remote.token);
+  return remote.token;
+};
+// The handle back from a stored token, revivable in another isolate or another
+// process. Verification happens per call.
+const restoreCapability = (token) => {
+  if (typeof token !== "string")
+    throw new TypeError(
+      "restoreCapability() takes the token string capabilityToken() returned.");
+  __cap_persistable(token);
+  // `stored` -- the row owns the reference, so disposal must not release the
+  // owner's entry. `durable` -- the revived handle may be persisted again.
+  return __foreignStub(token, undefined, true, true);
+};
 // Workerd's entrypoint method-visibility rules (worker-rpc.c++):
 // reserved lifecycle names are refused outright; only prototype
 // methods and accessors are visible -- never own instance state
@@ -5560,7 +5608,8 @@ const __storedLift = (value) => {
           "durable identity: persistent stubs from ctx.restore, " +
           "service stubs from ctx.exports and Durable Object stubs. " +
           "This value is a transient RPC handle that would not " +
-          "survive a restart.",
+          "survive a restart. Store capabilityToken(value) instead: the " +
+          "token is what survives.",
           "DataCloneError");
       lifted = true;
       // The stored row owns a reference of its own, so disposing the original
@@ -10592,6 +10641,12 @@ const __cf = __celld.__cf = {
   // Durable Object implements to rebuild a persistent stub's target from the
   // params stored by `ctx.restore(params)`.
   restore: Symbol.for("cloudflare:restore"),
+  // celld: the two halves of persisting a *transient* capability. A received
+  // stub cannot be stored (its entry dies with its isolate); its token can, and
+  // a restored Durable Object revives it here instead of asking its client to
+  // subscribe again.
+  capabilityToken,
+  restoreCapability,
   // `import { waitUntil } from "cloudflare:workers"`: register into
   // the current event or extend its active background work. Outside either
   // lifetime this is Workerd's global-scope error.

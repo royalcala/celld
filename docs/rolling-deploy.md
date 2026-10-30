@@ -24,6 +24,31 @@ is upgraded.  The compat path deliberately does not accept transient legacy
 tokens, because they carry no node or isolate incarnation and could alias a
 reused handle.
 
+## Persisted session tokens
+
+`capabilityToken(stub)` / `restoreCapability(token)` (both from
+`cloudflare:workers`) let an application store a transient capability as its
+token and revive it later — the shape a Durable Object needs to re-arm a
+subscription that lives in a browser session.  Under a rolling upgrade:
+
+- A stored token is a normal current-version transient token, so it is fenced
+  exactly like a live one: it survives a node restart (the key is derived from
+  the persisted peer secret and the owner is a session isolate that outlives the
+  object), and it fails typed the moment the owner's isolate incarnation is
+  gone.
+- A build that predates the surface has no `capabilityToken` /
+  `restoreCapability` export: in a bundle importing either the name is
+  `undefined`, so the first call throws instead of storing or reviving anything.
+  Upgrade every node that may host the deployment **before** deploying such a
+  bundle — the same rule as any other new surface.  It is deliberately not a
+  config-driven deployment feature: nothing in the manifest describes an
+  application's import of a module export, so a required-feature gate could not
+  be derived from the deployment.
+- The stored token itself stays a current-version token, so the matrix above is
+  unchanged: a later token-layout change reaches persisted tokens with the same
+  `forbidden` / typed behaviour as live ones, and a stored token is never a
+  separate compatibility path.
+
 ## Local / CI bucket endpoint
 
 Use `tools/s3gw` (vendored, `us-s3gw`). It is the small `s3s`-based store with

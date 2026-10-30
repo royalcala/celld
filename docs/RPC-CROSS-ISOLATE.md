@@ -17,7 +17,11 @@ export.
 ## Invariants
 
 - JavaScript never receives a raw handle, owner scope, heap id or capability
-  secret.  It sees an opaque proxy; every operation is a host call.
+  secret.  It sees an opaque proxy; every operation is a host call.  The one
+  value it can read back is the *token* of a capability it already holds, and
+  only to persist it (`capabilityToken`): the token is the stub's own wire form,
+  carries no handle id, scope or key material in the clear, and grants exactly
+  the authority the stub in hand already grants.
 - A token is authenticated with the fleet key (HMAC).  The key is derived from
   the persisted peer secret, so it is stable across node restarts and shared by
   nodes in the same fleet, and never written to the bucket.
@@ -83,9 +87,27 @@ Service stubs and their storage revival live in `js/harness.js`.
   owner ops.  Transfer moves the one reference; disposal releases it and the
   last release disposes the bridge.  A disposed or moved owner fails typed.
 - **Durable restore** stores `{spec|parent, params}` in the cell's
-  `_cf_RESTORE` table, keyed by a durable handle.  Disposal deletes unused
-  rows; stored child rows keep a parent reference alive.  `[restore]` is
+  `_cf_RESTORE` table, keyed by a durable handle. Disposal deletes unused
+  rows; stored child rows keep a parent reference alive. `[restore]` is
   replayed once per residency and cached; cell release drops the cache.
+- **Persisted capabilities** (`capabilityToken` / `restoreCapability`, both
+  exported from `cloudflare:workers`). A transient handle whose target lives in
+  a session isolate cannot be stored as a stub, and deliberately so: its entry
+  id dies with that isolate and would resolve to garbage after a restart. Its
+  *token* can be stored — it is already the stub's wire form (an HMAC over
+  owner, node, isolate incarnation and dial address). `capabilityToken(stub)`
+  returns that string for a capability this isolate received, after the host has
+  checked the whole fence (see `__cap_persist`) and taken one exported reference
+  on the persisted row's behalf. `restoreCapability(token)` verifies the MAC and
+  the fence again and rebuilds a handle whose every call is re-verified against
+  the owner (`owner-gone` / `owner-moved` / `stale-generation`, never a reused
+  entry). Nothing weaker is revivable: a cell handle, a durable `ctx.restore`
+  handle, a version 1 transient token and a token without node, incarnation or
+  address are refused typed (`forbidden`). Lifetime: the stored token owns one
+  exported reference and a string has nowhere to put a disposal, so deleting the
+  row is what lets the owner's handle go — the same irreversibility a durable
+  restore row has. A restored object uses this to re-arm a subscription that
+  lives in a session on another node, with no client-side repair.
 
 ## Routing, ownership and failover
 
@@ -180,7 +202,14 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
   not replayed (a retry could duplicate a side effect).
 - Disposing a foreign capability on a receiving node does not currently send a
   remote release; the owner entry is reclaimed with its cell/isolate.  Durable
-  rows are irrevocable in the stored window.
+  rows are irrevocable in the stored window.  A token persisted by
+  `capabilityToken` behaves the same way: it holds one exported reference until
+  the application deletes the row, and the owner's handle is reclaimed with its
+  isolate.
+- A persisted session token is fenced, not renewable: it names one isolate
+  incarnation of the session's node, so a session that reconnects brings a new
+  token and the application rewrites the row.  That is the intended lifetime —
+  the ticket is the subscription, not the connection.
 - Nested facets across deployed scripts are limited to the parent-chain shape
   used by gatekeeper/gadget facets.
 - The operator `/metrics` endpoint is internal-listener only; no external
@@ -189,8 +218,13 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
 
 ## Evidence and CI
 
-- `cargo test`: 36 unit tests (capabilities, secrets/crypto/redaction,
-  metrics, spans).
+- `cargo test`: unit tests (capabilities, secrets/crypto/redaction,
+  metrics, spans) plus the lab fixtures `retained_callback` (a retained,
+  re-entrant callback), `persisted_capability` (a fenced session capability
+  stored as a token and revived) and `persisted_capability_2node` (that token
+  surviving a hard kill of the node that owns the object: the restored object
+  re-arms and delivers to the session on the other node, and a delivery with the
+  session's node gone fails typed).
 - `scripts/e2e-2node.sh`: cross-node capability, BYOB stream, durable
   restore, stateless rejection, cancellation, hard kill takeover, strict
   single owner (bucket `own.json`), restart.
