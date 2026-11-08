@@ -395,6 +395,13 @@ Inc. a perpetual, irrevocable, worldwide, royalty-free, transferable,
 sublicensable license to use, modify, combine, relicense, redistribute, or
 publish the patch, in whole or in part, with or without attribution.
 
+### Work tracking and architecture
+
+- Planned work lives in `backlog/` (Backlog.md, task prefix `CELLD`): `backlog task list`.
+  Design records and operational limits stay in `docs/`; a task links them as references.
+  The migration inventory is in `docs/planning-migration.md`.
+- The architecture map lives in `groma/` and is edited only through the `groma` CLI.
+
 ## License
 
 [Apache-2.0](LICENSE)

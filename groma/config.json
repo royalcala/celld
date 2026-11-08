@@ -1,0 +1,9 @@
+{
+  "scanners": [],
+  "workSources": [
+    {
+      "id": "backlog",
+      "version": "1.55.3"
+    }
+  ]
+}

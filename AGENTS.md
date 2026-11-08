@@ -51,3 +51,20 @@ cargo test
 ```
 
 Los tests de integración/E2E están en `docs/testing.md`.
+
+## Trabajo (Backlog) y arquitectura (Groma)
+
+- El trabajo planificado vive en `backlog/` (Backlog.md, prefijo `CELLD`). Antes de empezar
+  algo, buscá con `backlog search` / `backlog task list`; antes de crear, empezar o cerrar una
+  tarea, leé `backlog instructions task-creation`, `task-execution` y `task-finalization`.
+  Usá el CLI `backlog`; no edites los archivos de tareas a mano.
+- Los registros de diseño, límites operativos y hallazgos quedan en `docs/`; no son tareas.
+  Una tarea los enlaza con `--ref`.
+- La migración del trabajo previo está en `docs/planning-migration.md`.
+- La arquitectura vive en `groma/` y se edita solo con el CLI `groma`.
+
+<!-- groma:start -->
+## Groma
+
+This project uses Groma. Before you scan, inspect, or curate architecture, or change files for a Backlog task, run `groma agent-instructions` and read the guide it names for that job. When it reports a first scan, ask the user whether they want you to curate the architecture. Do not edit Groma-owned architecture files directly.
+<!-- groma:end -->
