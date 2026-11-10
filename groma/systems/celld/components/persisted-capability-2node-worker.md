@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: crates/celld/tests/fixtures/persisted-capability-2node/worker.js
+  group: Test fixtures
+description: Test fixture for a persisted capability across two nodes.
 ---

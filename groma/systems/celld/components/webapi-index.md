@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/webapi/index.js
+  group: Examples
+description: Example Worker exercising Web APIs.
 ---

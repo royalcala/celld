@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/pi/index.js
+  group: Examples
+description: Example Worker computing pi.
 ---

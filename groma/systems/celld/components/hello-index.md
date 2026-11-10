@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/hello/index.js
+  group: Examples
+description: Hello-world Worker example.
 ---

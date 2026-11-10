@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/async/index.js
       symbol: Counter
+  group: Examples
+description: Example Worker demonstrating async handlers.
 ---

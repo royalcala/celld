@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/container/index.js
       symbol: MyContainer
+  group: Examples
+description: Example Worker demonstrating container-backed Durable Objects.
 ---

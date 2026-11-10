@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/workflow/index.js
       symbol: ReportBuilder
+  group: Examples
+description: Example Workflow.
 ---

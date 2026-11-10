@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/body/index.js
       symbol: Echo
+  group: Examples
+description: Example Worker demonstrating request and response bodies.
 ---

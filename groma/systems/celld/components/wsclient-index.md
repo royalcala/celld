@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/wsclient/index.js
       symbol: Client
+  group: Examples
+description: Example WebSocket client Worker.
 ---

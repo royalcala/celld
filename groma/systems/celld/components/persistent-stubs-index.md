@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/persistent-stubs/index.js
+  group: Examples
+description: Example persistent RPC stubs.
 ---

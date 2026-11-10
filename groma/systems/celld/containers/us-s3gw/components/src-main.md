@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: rust
       file: tools/s3gw/src/main.rs
+  group: S3 gateway
+description: Entrypoint of the test S3 gateway.
 ---

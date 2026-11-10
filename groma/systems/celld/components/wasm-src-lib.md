@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: rust
       file: examples/wasm/src/lib.rs
+  group: Examples
+description: WebAssembly example module.
 ---

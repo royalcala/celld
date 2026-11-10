@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/secrets-fixture/index.js
       symbol: Counter
+  group: Examples
+description: Fixture Worker exercising secret bindings.
 ---

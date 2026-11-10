@@ -8,4 +8,5 @@ groma:
   code:
     - scanner: python
       file: tools/s3gw/scripts/s3probe.py
+description: S3 probe script used by the fleet tests.
 ---

@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/vectordb/index.js
       symbol: Palette
+  group: Examples
+description: Example Worker using sqlite-vec.
 ---

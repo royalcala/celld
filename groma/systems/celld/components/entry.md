@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: python
       file: examples/python/src/entry.py
+  group: Examples
+description: Python Worker example entrypoint.
 ---

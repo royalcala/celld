@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/opencode/index.js
+  group: Examples
+description: Example Worker for code execution.
 ---

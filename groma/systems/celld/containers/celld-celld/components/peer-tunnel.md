@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: rust
       file: crates/celld/main/peer_tunnel.rs
+  group: RPC and networking
+description: Pooled peer tunnel carrying forwarded cell requests as HTTP.
 ---

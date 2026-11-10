@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/kv/index.js
+  group: Examples
+description: Example Worker using a KV namespace.
 ---

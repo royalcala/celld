@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: rust
       file: crates/celld/main.rs
+  group: Cell runtime
+description: 'Entrypoint of the celld node: startup, listeners, shutdown and the V8 shell.'
 ---

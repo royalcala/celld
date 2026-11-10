@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: python
       file: examples/container/server.py
+  group: Examples
+description: Python server example for a container-backed Durable Object.
 ---

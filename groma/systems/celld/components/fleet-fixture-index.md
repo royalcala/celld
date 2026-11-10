@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/fleet-fixture/index.js
+  group: Examples
+description: Fleet test fixture Worker.
 ---

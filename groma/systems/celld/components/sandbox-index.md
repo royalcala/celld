@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/sandbox/index.js
+  group: Examples
+description: Example Sandbox SDK Worker.
 ---

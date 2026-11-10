@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/queues/index.js
+  group: Examples
+description: Example Queue producer and consumer.
 ---

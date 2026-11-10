@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/r2/index.js
+  group: Examples
+description: Example Worker using an R2 bucket.
 ---

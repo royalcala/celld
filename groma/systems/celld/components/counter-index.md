@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/counter/index.js
       symbol: Counter
+  group: Examples
+description: Example Durable Object counter.
 ---

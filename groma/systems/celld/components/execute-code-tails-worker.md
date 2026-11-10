@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: crates/celld/tests/fixtures/execute-code-tails/worker.js
+  group: Test fixtures
+description: Test fixture Worker for dynamic code execution and Tail events.
 ---

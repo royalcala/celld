@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: rust
       file: crates/celld/main/websocket.rs
+  group: RPC and networking
+description: Ingress WebSocket acceptance, routing and pumping tasks.
 ---

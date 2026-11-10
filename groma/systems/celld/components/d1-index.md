@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/d1/index.js
+  group: Examples
+description: Example Worker using a D1 database.
 ---

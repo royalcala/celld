@@ -8,4 +8,6 @@ groma:
   code:
     - scanner: javascript
       file: examples/cron/index.js
+  group: Examples
+description: Example Worker driven by Cron Triggers.
 ---

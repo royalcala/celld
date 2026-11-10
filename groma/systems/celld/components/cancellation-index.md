@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/cancellation/index.js
       symbol: TestDO
+  group: Examples
+description: Example Worker demonstrating request cancellation.
 ---

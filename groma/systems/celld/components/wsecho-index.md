@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/wsecho/index.js
       symbol: W
+  group: Examples
+description: Example WebSocket echo Worker.
 ---

@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/dynamic-worker-tails/index.js
       symbol: DynamicWorkerTail
+  group: Examples
+description: Example dynamic Worker with Tail Worker observability.
 ---

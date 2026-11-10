@@ -9,4 +9,6 @@ groma:
     - scanner: javascript
       file: examples/alarm/index.js
       symbol: Agent
+  group: Examples
+description: Example Worker demonstrating Durable Object alarms.
 ---
