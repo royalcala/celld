@@ -21,6 +21,19 @@ Si sos una sesión nueva, leé esto y los docs enlazados antes de tocar código.
   persistencia de stubs. `celld-os` depende de esto.
 - No commitear ni mezclar cambios de producto en esta rama sin coordinación.
 
+## Ramas
+
+- `upstream/main` es el repo original de denoland. Solo se usa para sync.
+- `origin/main` es el espejo del fork; no es base de trabajo ni de deploy.
+- `celld-os/rpc` es la rama de integración de `1us/celld-os`. Es la base para
+  features, fixes y para el branch de adopción.
+- `celld/backlog-groma-adoption` se integra en `celld-os/rpc`, nunca en main.
+- Las ramas nuevas salen de `celld-os/rpc`:
+  `git switch -c <tipo>/<tema> celld-os/rpc`.
+- El sync con upstream se hace sobre `celld-os/rpc`, no sobre main.
+- Detalle: [decision-1](backlog/decisions/decision-1%20-%20Integration-branch-is-celld-os-rpc.md)
+  + [doc-1](backlog/docs/doc-1%20-%20Branching-and-upstream-sync.md).
+
 ## Leer primero
 
 - `README.md`

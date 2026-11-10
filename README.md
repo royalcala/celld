@@ -402,6 +402,14 @@ publish the patch, in whole or in part, with or without attribution.
   The migration inventory is in `docs/planning-migration.md`.
 - The architecture map lives in `groma/` and is edited only through the `groma` CLI.
 
+### Ramas
+
+La línea de trabajo de `1us/celld-os` es `celld-os/rpc`. `main`/`upstream` es la
+línea original y no es base de integración. Ver [AGENTS.md](AGENTS.md) y la
+decisión de Backlog
+[decision-1](backlog/decisions/decision-1%20-%20Integration-branch-is-celld-os-rpc.md)
+"Integration branch is celld-os/rpc".
+
 ## License
 
 [Apache-2.0](LICENSE)
