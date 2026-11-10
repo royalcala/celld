@@ -4,13 +4,16 @@ title: In-flight RPC and streams at hard kill are not replayed
 status: To Do
 assignee: []
 created_date: '2026-11-08T16:23:00Z'
-updated_date: '2026-11-08T16:24:00Z'
+updated_date: '2026-11-10T19:21:00Z'
 labels: []
 dependencies: []
 references:
   - docs/PR-READY.md
   - docs/guarantees.md
   - docs/RPC-CROSS-ISOLATE.md
+  - capability
+  - peer-tunnel
+  - http-streams
 priority: low
 type: task
 ordinal: 6000

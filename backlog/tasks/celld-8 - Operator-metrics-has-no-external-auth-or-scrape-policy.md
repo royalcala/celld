@@ -4,12 +4,14 @@ title: Operator /metrics has no external auth or scrape policy
 status: To Do
 assignee: []
 created_date: '2026-11-08T16:23:00Z'
-updated_date: '2026-11-08T16:24:00Z'
+updated_date: '2026-11-10T19:21:00Z'
 labels: []
 dependencies: []
 references:
   - docs/PR-READY.md
   - docs/security.md
+  - observability
+  - telemetry
 priority: medium
 type: task
 ordinal: 8000

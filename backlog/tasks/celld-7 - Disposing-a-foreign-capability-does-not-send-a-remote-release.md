@@ -4,12 +4,14 @@ title: Disposing a foreign capability does not send a remote release
 status: To Do
 assignee: []
 created_date: '2026-11-08T16:23:00Z'
-updated_date: '2026-11-08T16:24:00Z'
+updated_date: '2026-11-10T19:21:00Z'
 labels: []
 dependencies: []
 references:
   - docs/PR-READY.md
   - docs/RPC-CROSS-ISOLATE.md
+  - capability
+  - cell-dispatch
 priority: low
 type: task
 ordinal: 7000

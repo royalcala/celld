@@ -75,6 +75,11 @@ Los tests de integración/E2E están en `docs/testing.md`.
   Una tarea los enlaza con `--ref`.
 - La migración del trabajo previo está en `docs/planning-migration.md`.
 - La arquitectura vive en `groma/` y se edita solo con el CLI `groma`.
+- Los links de arquitectura se agregan con `--add-ref <element-id|file>`; usá el
+  ID real o el archivo exacto, nunca un ID inventado.
+- `--doc` y `--ref` son contexto: no sustituyen un link de arquitectura.
+- Registrá `--modified-file` después de cada cambio; las tareas de curación
+  listan todos los paths de `groma/` que cambiaron.
 
 <!-- groma:start -->
 ## Groma

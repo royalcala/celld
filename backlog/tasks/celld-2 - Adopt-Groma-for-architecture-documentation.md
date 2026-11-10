@@ -4,11 +4,14 @@ title: Adopt Groma for architecture documentation
 status: Done
 assignee: []
 created_date: '2026-11-08T16:23:00Z'
-updated_date: '2026-11-08T16:24:00Z'
+updated_date: '2026-11-10T19:21:00Z'
 labels: []
 milestone: m-0
 dependencies:
   - CELLD-1
+references:
+  - celld
+  - celld-celld
 modified_files:
   - groma/config.json
   - groma/index.md
