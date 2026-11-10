@@ -1,0 +1,11 @@
+---
+type: C4 Component
+title: Node os
+status: stable
+groma:
+  id: node-os
+  parent: celld
+  code:
+    - scanner: javascript
+      file: crates/celld/js/node_os.js
+---
