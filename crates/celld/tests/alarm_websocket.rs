@@ -56,7 +56,8 @@ fn http_ready(port: u16) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
-    let _ = stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let _ =
+        stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     response.starts_with(b"HTTP/1.")

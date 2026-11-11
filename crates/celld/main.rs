@@ -4378,30 +4378,31 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let forward_auth = app.peer_auth.clone();
     celld::js::install_capability_forwarder(std::sync::Arc::new(
         move |node, addr, token, path, args| {
-        let http = forward_http.clone();
-        let auth = forward_auth.clone();
-        Box::pin(async move {
-            let peer = peer_tunnel::Peer {
-                http: &http,
-                auth: &auth,
-                addr: &addr,
-                node: &node,
-            };
-            let response = peer_tunnel::cap(&peer, &token, &path, args, None).await?;
-            let status = response.status();
-            let body = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .map_err(|error| anyhow::anyhow!("read capability reply: {error}"))?
-                .to_bytes();
-            if status != hyper::StatusCode::OK {
-                anyhow::bail!(
-                    "capability call rejected by {addr}: {}",
-                    String::from_utf8_lossy(&body)
-                );
-            }
-            Ok(body.to_vec())
-        })
-    }));
+            let http = forward_http.clone();
+            let auth = forward_auth.clone();
+            Box::pin(async move {
+                let peer = peer_tunnel::Peer {
+                    http: &http,
+                    auth: &auth,
+                    addr: &addr,
+                    node: &node,
+                };
+                let response = peer_tunnel::cap(&peer, &token, &path, args, None).await?;
+                let status = response.status();
+                let body = http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("read capability reply: {error}"))?
+                    .to_bytes();
+                if status != hyper::StatusCode::OK {
+                    anyhow::bail!(
+                        "capability call rejected by {addr}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                Ok(body.to_vec())
+            })
+        },
+    ));
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a

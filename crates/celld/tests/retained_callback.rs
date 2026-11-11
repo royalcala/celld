@@ -57,7 +57,8 @@ fn http_ready(port: u16) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
-    let _ = stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let _ =
+        stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     response.starts_with(b"HTTP/1.")
@@ -211,7 +212,8 @@ fn retained_callback_survives_the_callers_release() {
         let lease = response_body(&http_get(port, "/lease")?);
         if lease != "true" {
             return Err(std::io::Error::other(format!(
-                "returned RpcTarget method failed: {lease:?}")));
+                "returned RpcTarget method failed: {lease:?}"
+            )));
         }
         // A receiver that calls the callback *inside* the call that delivered it must reach it:
         // a subscription's streamGeneration and replay happen that way.
@@ -222,13 +224,15 @@ fn retained_callback_survives_the_callers_release() {
             && persisted.contains("only store stubs with durable identity"))
         {
             return Err(std::io::Error::other(format!(
-                "session capability storage was not refused as expected: {persisted}")));
+                "session capability storage was not refused as expected: {persisted}"
+            )));
         }
 
         let during = response_body(&http_get(port, "/during")?);
         if during != "during:during" {
             return Err(std::io::Error::other(format!(
-                "re-entrant callback failed from a fetch: {during:?}")));
+                "re-entrant callback failed from a fetch: {during:?}"
+            )));
         }
         // Same, from a WebSocket message handler that is awaiting the object's reply -- the shape a
         // session's subscribe call takes.
@@ -236,7 +240,8 @@ fn retained_callback_survives_the_callers_release() {
         let frame = ws_client_text(&mut socket, "during")?;
         if frame != "result:during:during" {
             return Err(std::io::Error::other(format!(
-                "re-entrant callback failed from a websocket message: {frame:?}")));
+                "re-entrant callback failed from a websocket message: {frame:?}"
+            )));
         }
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut outcome = String::new();
