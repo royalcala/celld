@@ -574,6 +574,20 @@ pub(crate) fn log_to_wire(
     }
 }
 
+/// The durable first sighting of an ensemble member with no lease record.
+/// It is the clock for an absence recovery cannot date from a lease: the
+/// dead-node GC deletes the record, and a restarting member republishes a new
+/// generation, so only the observation itself says how long the name has been
+/// gone. The marker lives under the session prefix and is retired with it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AbsentMember {
+    first_seen_ms: u64,
+}
+
+fn absent_member_key(session: &str, epoch: u64, member: &str) -> String {
+    format!("log/{session}/absent/e{epoch}/{member}.json")
+}
+
 pub(crate) async fn read_record(
     bucket: &Bucket,
     session: &str,
@@ -4543,7 +4557,10 @@ impl NodeLogManager {
             let Some((generation, tail)) = rest.split_once('/') else {
                 continue;
             };
-            if !tail.starts_with("bundle/") && !tail.starts_with("recovered/") {
+            if !tail.starts_with("bundle/")
+                && !tail.starts_with("recovered/")
+                && !tail.starts_with("absent/")
+            {
                 continue;
             }
             if format!("{}/{generation}", self.node) == self.session {
@@ -4916,6 +4933,89 @@ impl NodeLogManager {
         Ok(())
     }
 
+    /// The first instant this recovery observed `member` with no lease record
+    /// for the session at `epoch`.
+    async fn absent_member_first_seen(
+        &self,
+        session: &str,
+        epoch: u64,
+        member: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some((bytes, _)) = self
+            .bucket
+            .get(&absent_member_key(session, epoch, member))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let marker: AbsentMember = serde_json::from_slice(&bytes)?;
+        Ok(Some(marker.first_seen_ms))
+    }
+
+    /// Persist the first sighting. A racing recoverer that read `None` too
+    /// may overwrite it with a slightly later instant, which only lengthens
+    /// the wait and never turns a fresh absence into a conclusive one.
+    async fn record_absent_member(
+        &self,
+        session: &str,
+        epoch: u64,
+        member: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.bucket
+            .put(
+                &absent_member_key(session, epoch, member),
+                serde_json::to_vec(&AbsentMember {
+                    first_seen_ms: now_ms,
+                })?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a member with no lease record is conclusively gone.
+    ///
+    /// The first sighting is recorded before the verdict, so the next pass
+    /// seals after the same grace window the expired-lease path uses instead
+    /// of restarting the wait. A read error is not evidence of absence: the
+    /// caller keeps that member undecided.
+    async fn absent_member_is_gone(
+        &self,
+        session: &str,
+        epoch: u64,
+        member: &str,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> anyhow::Result<bool> {
+        // The ensemble normally holds names this node validated when it
+        // recruited them. A record is bucket data, so refuse to build a key
+        // from anything the fleet's own identity rule would not accept.
+        if crate::machine::validate_node_name(member).is_err() {
+            return Ok(false);
+        }
+        let first_seen = match self
+            .absent_member_first_seen(session, epoch, member)
+            .await?
+        {
+            Some(first_seen) => first_seen,
+            None => {
+                self.record_absent_member(session, epoch, member, now_ms)
+                    .await?;
+                warn!(
+                    session,
+                    epoch,
+                    member,
+                    grace_ms,
+                    "ensemble member has no lease record; recorded the absence and retrying after the grace window"
+                );
+                now_ms
+            }
+        };
+        Ok(log_tier::absent_member_is_gone(
+            first_seen, now_ms, grace_ms,
+        ))
+    }
+
     async fn recover_serial(&self, dead: &str, mode: RecoverMode) -> anyhow::Result<()> {
         let stale_after_ms = RECOVERY_CLAIM_TTL.as_millis() as u64;
         for _attempt in 0..5 {
@@ -5076,12 +5176,45 @@ impl NodeLogManager {
                     &lease,
                     Ok(Some(lease)) if lease.expires_ms.saturating_add(grace_ms) < now
                 );
-                let addr = match lease {
-                    Ok(Some(lease)) => Some(lease.addr),
+                // A member that is present again starts a fresh blink: its
+                // older absence marker must not turn a later disappearance
+                // into an instant loss. Best effort; a stale marker only
+                // lengthens a wait.
+                if matches!(&lease, Ok(Some(_)))
+                    && crate::machine::validate_node_name(member).is_ok()
+                {
+                    let _ = self
+                        .bucket
+                        .delete(&absent_member_key(dead, record.epoch, member))
+                        .await;
+                }
+                let addr = match &lease {
+                    Ok(Some(lease)) => Some(lease.addr.clone()),
                     _ => None,
                 };
                 let Some(addr) = addr else {
-                    if lease_live || !lease_long_dead {
+                    // No address to ask. An absent record is the one member
+                    // fate this classifier cannot date from a lease: the
+                    // dead-node GC deletes a dead record that carries no
+                    // folded log, so the ensemble can name a node the bucket
+                    // no longer knows. Record the first sighting and judge it
+                    // after the grace window; a read error stays undecided.
+                    let absent_gone = match &lease {
+                        Ok(None) => self
+                            .absent_member_is_gone(dead, record.epoch, member, now, grace_ms)
+                            .await
+                            .unwrap_or_else(|error| {
+                                warn!(
+                                    member,
+                                    dead,
+                                    %error,
+                                    "could not record an absent ensemble member"
+                                );
+                                false
+                            }),
+                        _ => false,
+                    };
+                    if !absent_gone && (lease_live || !lease_long_dead) {
                         inconclusive += 1;
                     }
                     continue;
@@ -6474,7 +6607,9 @@ impl NodeLogManager {
             .map(|meta| meta.location.as_ref().to_string())
             .filter(|key| {
                 key.strip_prefix(&prefix).is_some_and(|tail| {
-                    tail.starts_with("bundle/") || tail.starts_with("recovered/")
+                    tail.starts_with("bundle/")
+                        || tail.starts_with("recovered/")
+                        || tail.starts_with("absent/")
                 })
             })
             .collect();

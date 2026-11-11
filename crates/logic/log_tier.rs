@@ -74,6 +74,20 @@ pub fn create_record(ensemble: BTreeSet<NodeId>, bucket_end: Offset) -> Option<L
     })
 }
 
+/// A member whose lease record is *absent* from the bucket.
+///
+/// Under the lease fold a node's session record lives in its lease, and the
+/// dead-node GC deletes a dead record that carries no folded log instead of
+/// tombstoning it. An ensemble can therefore name a node the bucket no longer
+/// knows. Absence is not death by itself: a restarting member may publish a
+/// new generation and answer for its retained fragment. Recovery records the
+/// first observation beside the session and treats the absence as conclusive
+/// only after the same grace window the expired-lease path uses. Without this,
+/// a vanished follower is undecided forever and the session can never seal.
+pub fn absent_member_is_gone(first_seen_ms: u64, now_ms: u64, grace_ms: u64) -> bool {
+    now_ms.saturating_sub(first_seen_ms) >= grace_ms
+}
+
 /// One follower's copy of one node log: the open fragment `(base, end]` at
 /// its fragment epoch, plus the persisted seal mark.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,4 +480,22 @@ pub fn fleet_shortfall(
     } else {
         Shortfall::NoEligiblePeer
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absent_member_is_gone;
+
+    #[test]
+    fn an_absent_member_is_not_gone_before_the_grace_window() {
+        assert!(!absent_member_is_gone(1_000, 1_000, 20_000));
+        assert!(!absent_member_is_gone(1_000, 20_999, 20_000));
+    }
+
+    #[test]
+    fn an_absent_member_is_gone_once_the_grace_window_elapses() {
+        assert!(absent_member_is_gone(1_000, 21_000, 20_000));
+        // A clock that steps backwards must not make the wait negative.
+        assert!(!absent_member_is_gone(21_000, 1_000, 20_000));
+    }
 }

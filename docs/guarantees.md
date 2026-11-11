@@ -222,6 +222,33 @@ Recovery has these limits:
   acknowledgement, so the loss record can report an uncertified range when no
   acknowledged write is missing.
 
+A follower whose lease record is gone is the one member fate recovery can
+retire without an operator. The dead-node GC deletes a dead record that carries
+no folded log instead of tombstoning it, so an ensemble can name a node the
+bucket no longer knows; reading that member returns "no record", which is not
+the same fact as an expired lease. Recovery records the first sighting at
+`log/<session>/absent/e<epoch>/<member>.json`, keeps the member undecided, and
+retries on the maintenance tick. After the same 3x-TTL grace (at least 20 s) the
+absence is conclusive: when no member returned a complete witness and the epoch
+may have fleet acknowledgements, recovery writes `log/<session>.loss.json`,
+drains every retained bundle into the per-cell prefixes, and seals. The takeover
+then proceeds, and the sealed session's recovery objects and absence markers are
+retired by the normal sweep.
+
+This is the automatic replacement for deleting `log/<session>/` by hand. That
+deletion skips the bundle drain, so it can drop acknowledged writes without the
+loss record. The refusal names the condition:
+
+```
+node-log recovery for <session>: no complete true witness among {...} and N
+member(s) undecided; refusing to seal while member state remains unverified
+```
+
+Before the grace elapses the refusal is expected and bounded. A refusal that
+continues past it is a read error (the first limit above), not a missing
+record. `nodes/<member>.json` being absent while the session record still names
+it is the shape this path retires.
+
 A restarting node serves authenticated follower seal and tail requests before
 its own predecessor recovery completes, so nodes that restart together can
 recover acknowledged writes from surviving follower disks. It accepts
