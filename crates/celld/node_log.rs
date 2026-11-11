@@ -5270,13 +5270,24 @@ impl NodeLogManager {
                     Ok(sealed) => sealed,
                     Err(error) => {
                         // Startup serves follower requests before it renews
-                        // the lease. An HTTP error proves a response, not a
-                        // missing fragment: a transient scan failure on an
-                        // expired member must not seal away its intact rows.
+                        // the lease. Inside the grace an answered error can
+                        // still be a member that is booting with its rows
+                        // intact, so it stays undecided. Past the grace the
+                        // lease is long dead and the stored addr can belong
+                        // to a different process: a 404 or a protocol error
+                        // proves only that someone answered. Counting that
+                        // answer as undecided kept a legacy session
+                        // recovering forever (CELLD-16).
                         let answered = error.downcast_ref::<PeerHttpError>().is_some()
                             || error.downcast_ref::<serde_json::Error>().is_some();
-                        if answered || lease_live || !lease_long_dead {
+                        if lease_live || !lease_long_dead {
                             inconclusive += 1;
+                        } else if answered {
+                            warn!(
+                                member,
+                                dead,
+                                "expired member's stale address answered with an error after the grace; treating the member as gone"
+                            );
                         }
                         continue;
                     }

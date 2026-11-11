@@ -210,8 +210,10 @@ recovery requirement.
 
 Recovery has these limits:
 
-- A follower's HTTP error does not prove its data is absent, even when its
-  lease has expired, so persistent errors can block recovery and startup.
+- A follower's HTTP error does not prove its data is absent while its lease is
+  live or inside the grace, so persistent errors there can block recovery and
+  startup. Past the grace the stored address can belong to a different
+  process; an answered error from it is conclusively gone, not undecided.
 - A restarted follower cannot certify a range with a damaged batch or a gap
   until valid data covers it.
 - An older node's entries-only tail (`CLT1`) proves neither completeness nor
@@ -255,6 +257,13 @@ ensemble member as live, expired, absent (with the recorded absence age and the
 remaining grace) or unreadable. It writes nothing. The automatic recovery path
 remains the only seal path; there is no `prune` that could skip the loss record
 or the bundle drain.
+
+An expired lease whose stored address no longer serves that member follows the
+same grace. Inside the grace an answered error stays undecided because a
+booting member can still publish its rows; past the grace the address is stale,
+so a 404 or a protocol error is not a witness. Recovery treats the member as
+gone, writes `log/<session>.loss.json` when fleet acknowledgements may exist,
+and seals.
 
 A restarting node serves authenticated follower seal and tail requests before
 its own predecessor recovery completes, so nodes that restart together can
