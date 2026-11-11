@@ -588,6 +588,46 @@ fn absent_member_key(session: &str, epoch: u64, member: &str) -> String {
     format!("log/{session}/absent/e{epoch}/{member}.json")
 }
 
+/// Read a node lease for a reader that only inspects the record.
+///
+/// `celld log status` answers from the bucket alone, so it must not build the
+/// write-side ownership store just to read one object. It reads the same key
+/// this module writes.
+pub(crate) async fn read_lease_wire(
+    bucket: &Bucket,
+    node: &str,
+) -> anyhow::Result<Option<crate::ownership_store::NodeLeaseWire>> {
+    let Some((bytes, _)) = bucket.get(&lease_key(node)).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// The first instant recovery recorded this ensemble member as absent.
+///
+/// `None` means recovery has not observed the absence yet (or the member is
+/// not a valid node identity), which is different from a marker that exists
+/// and dates the absence. The reader never writes a marker; only recovery
+/// does, on its first pass over an absent member.
+pub(crate) async fn absent_member_first_seen(
+    bucket: &Bucket,
+    session: &str,
+    epoch: u64,
+    member: &str,
+) -> anyhow::Result<Option<u64>> {
+    if crate::machine::validate_node_name(member).is_err() {
+        return Ok(None);
+    }
+    let Some((bytes, _)) = bucket
+        .get(&absent_member_key(session, epoch, member))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let marker: AbsentMember = serde_json::from_slice(&bytes)?;
+    Ok(Some(marker.first_seen_ms))
+}
+
 pub(crate) async fn read_record(
     bucket: &Bucket,
     session: &str,

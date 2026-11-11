@@ -43,6 +43,7 @@ pub(crate) enum Action {
     Cell(Vec<String>),
     D1(Vec<String>),
     Kv(Vec<String>),
+    Log(Vec<String>),
     Queue(Vec<String>),
     R2(Vec<String>),
     Connect(Vec<String>),
@@ -80,6 +81,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
             "kv" => return Ok(Action::Kv(arguments)),
+            "log" => return Ok(Action::Log(arguments)),
             "queue" => return Ok(Action::Queue(arguments)),
             "r2" => return Ok(Action::R2(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
@@ -284,6 +286,7 @@ USAGE:
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  celld log status --bucket [s3://|gs://|az://]NAME[/PREFIX] [--json]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...

@@ -249,6 +249,13 @@ continues past it is a read error (the first limit above), not a missing
 record. `nodes/<member>.json` being absent while the session record still names
 it is the shape this path retires.
 
+`celld log status --bucket ...` answers the same question from the bucket alone,
+without a running node: it lists every open or recovering session and each
+ensemble member as live, expired, absent (with the recorded absence age and the
+remaining grace) or unreadable. It writes nothing. The automatic recovery path
+remains the only seal path; there is no `prune` that could skip the loss record
+or the bundle drain.
+
 A restarting node serves authenticated follower seal and tail requests before
 its own predecessor recovery completes, so nodes that restart together can
 recover acknowledged writes from surviving follower disks. It accepts

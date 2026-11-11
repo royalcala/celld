@@ -73,6 +73,7 @@ pub mod js;
 pub mod kv_blob;
 pub mod kv_cli;
 pub(crate) mod local_store;
+pub mod log_cli;
 pub mod ltx_repl;
 pub mod ltx_replication;
 pub mod machine;
