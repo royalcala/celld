@@ -86,3 +86,22 @@ Los tests de integración/E2E están en `docs/testing.md`.
 
 This project uses Groma. Before you scan, inspect, or curate architecture, or change files for a Backlog task, run `groma agent-instructions` and read the guide it names for that job. When it reports a first scan, ask the user whether they want you to curate the architecture. Do not edit Groma-owned architecture files directly.
 <!-- groma:end -->
+
+## Tasks cross-repo
+
+- Podés crear una task en el Backlog de otro repo cuando el trabajo pertenece a
+  ese repo. Es la única escritura permitida en otro repo.
+- Buscá primero en el Backlog destino:
+  `cd <repo-destino> && backlog search "<tema>" --plain`.
+- Creá la task con el CLI:
+  `cd <repo-destino> && backlog task create "<título>" ...`.
+- No edites código, docs, secretos, Groma, `org.json` ni branches del repo
+  destino. No commitees ni pushees allí.
+- Dejá la task creada y reportá el ID al supervisor; el agente/operador del repo
+  destino la commitea.
+- Si el repo destino no tiene Backlog, no lo inicialices: creá una task en tu
+  repo con `--ref` al repo destino y pedí intervención del supervisor.
+- No asignes a un agente peer si Supervisión no te lo permite. Dejala sin
+  assignee y reportá el ID.
+- Esta excepción solo autoriza `backlog task create`; no reemplaza las reglas de
+  código, secretos, deploy, merge ni push.
