@@ -199,7 +199,10 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
 ## Limits / known issues
 
 - In-flight RPC/stream at the instant of a hard node death is ambiguous; it is
-  not replayed (a retry could duplicate a side effect).
+  not replayed (a retry could duplicate a side effect). This is the contract,
+  not a gap: the caller gets `transport`/`owner-moved`, and retry is the
+  application's decision. See
+  [in-flight calls at a hard kill](guarantees.md#in-flight-calls-at-a-hard-kill).
 - Disposing a foreign capability on a receiving node does not currently send a
   remote release; the owner entry is reclaimed with its cell/isolate.  Durable
   rows are irrevocable in the stored window.  A token persisted by

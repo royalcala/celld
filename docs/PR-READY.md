@@ -77,10 +77,15 @@ re-acquired, durable handles ride the bounded compat path.
 
 ## Known limits
 
-In-flight RPC/stream at the instant of a hard kill is ambiguous and not
-replayed; disposing a foreign capability does not send a remote release (the
-owner entry is reclaimed with its cell/isolate); nested deployed-script facets
-are limited to the gatekeeper/gadget parent-chain shape.
+Disposing a foreign capability does not send a remote release (the owner entry
+is reclaimed with its cell/isolate); nested deployed-script facets are limited
+to the gatekeeper/gadget parent-chain shape.
+
+An in-flight RPC or stream at the instant of a hard kill is not replayed. That
+is a decided contract, not an open gap: the runtime cannot prove the handler did
+not commit, so it settles the caller with `transport`/`owner-moved` and leaves
+retry to the application. See
+[in-flight calls at a hard kill](guarantees.md#in-flight-calls-at-a-hard-kill).
 
 The operator `/metrics` exposure is no longer open: the endpoint keeps the
 internal listener's network boundary as its default and accepts an optional

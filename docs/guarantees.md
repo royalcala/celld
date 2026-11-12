@@ -351,6 +351,36 @@ event for each store request against the node's own lease record, with an
 carries the store failure in an `error` field; a `found` carries the record's
 `generation`. The target costs nothing at other filters.
 
+### In-flight calls at a hard kill
+
+A call already sent to a node that dies cannot be replayed by the runtime. The
+handler may have committed a write, and a retry would run it twice: the runtime
+cannot tell "never started" from "ran and committed" once the process is gone.
+celld therefore settles the caller with an error instead of guessing.
+
+The contract:
+
+- **A settled response is a fact.** A call whose response reached the caller
+  ran, and its writes are durable under the output gate.
+- **An unsettled call is ambiguous.** When the owner dies mid-call, the caller
+  gets `transport`, or `owner-moved` when the cell has moved to another node, and
+  never a fabricated success. A response stream interrupted by the kill ends
+  with an error instead of resuming: nothing buffers the already-consumed bytes.
+- **Retry is the caller's decision, not the runtime's.** Re-issuing the call is
+  safe only when the application made the operation idempotent (an idempotency
+  key, an upsert, or a read). The runtime will not replay it on its own.
+- **A fenced node never resumes a call.** A node that lost its lease stops its
+  cells and fails every incomplete request. The successor activates the cell at
+  a higher epoch, so the caller's next request reaches the new owner with no
+  client action.
+
+This is the deliberate answer to "re-acquire or replay": the client
+re-acquires. A bounded runtime replay was rejected because no bound can prove
+the handler did not commit before the kill, so any replay trades a duplicate
+side effect for a maybe-lost call, and the runtime cannot tell which case it is
+in. A caller that needs at-most-once keeps its own idempotency key; celld
+does not invent one.
+
 ## Alarm discovery and the wake format
 
 SQLite stores the alarm deadline, consumption, retry state, and installation

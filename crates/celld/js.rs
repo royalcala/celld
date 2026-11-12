@@ -14097,6 +14097,39 @@ mod rpc_error_tests {
         );
         assert_eq!(classify_owner_error("cell overloaded"), "overloaded");
     }
+
+    /// CELLD-6: a hard kill mid-call leaves the caller with an ambiguous error,
+    /// never a success and never a silent retry. Two paths produce it: a peer
+    /// answers with a message the classifier reads, and a local dispatch site
+    /// sets the code directly. Both must land on `transport`/`owner-moved`.
+    #[test]
+    fn a_hard_kill_surfaces_as_an_ambiguous_error() {
+        // A peer-returned message: the owner process died while the call was
+        // in flight, so the connection that carried it is gone.
+        for message in [
+            "remote RPC transport failed: eof",
+            "peer refused the request",
+            "RPC proxy dropped: channel closed",
+        ] {
+            assert_eq!(
+                classify_owner_error(message),
+                "transport",
+                "{message:?} must read as an ambiguous transport failure"
+            );
+        }
+        // The successor owns the cell at a newer epoch by the time we look.
+        assert_eq!(
+            classify_owner_error("cell runtime is not published at epoch 7: X"),
+            "owner-moved"
+        );
+        // A local dispatch site sets the code itself rather than classifying a
+        // message, so pin the code it must produce.
+        assert_eq!(
+            split_rpc_error(&rpc_error("transport", "stub RPC owner dropped its result"))
+                .map(|(kind, _)| kind),
+            Some("transport")
+        );
+    }
 }
 
 #[cfg(test)]
