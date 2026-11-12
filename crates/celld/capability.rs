@@ -1097,4 +1097,26 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert!(!refs.is_empty());
     }
+
+    /// CELLD-7: the reference table is per process. A node that receives a
+    /// capability over RPC does not take an entry for it (only `dup()`,
+    /// `capabilityToken()` and re-exporting do), so disposing it there calls
+    /// `release` on a missing key and gets `None`. Only `Some(true)` asks the
+    /// owner to dispose, so a cross-node dispose is inert and the owner's entry
+    /// is reclaimed with its cell or isolate. This test pins the mechanism the
+    /// documented contract rests on.
+    #[test]
+    fn releasing_a_capability_a_process_never_retained_is_inert() {
+        let mut owner = CapabilityRefs::default();
+        // The exporting side mints the capability and owns the entry.
+        assert_eq!(owner.retain("owner-on-another-node", 42), 1);
+        // A different process (the receiving node) has its own table.
+        let mut receiver = CapabilityRefs::default();
+        assert_eq!(receiver.release("owner-on-another-node", 42), None);
+        assert!(receiver.is_empty());
+        // The owner's entry is untouched by the receiver's release, and only
+        // the owner's own final release disposes it.
+        assert_eq!(owner.count("owner-on-another-node", 42), Some(1));
+        assert_eq!(owner.release("owner-on-another-node", 42), Some(true));
+    }
 }

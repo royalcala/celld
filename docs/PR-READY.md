@@ -77,9 +77,14 @@ re-acquired, durable handles ride the bounded compat path.
 
 ## Known limits
 
-Disposing a foreign capability does not send a remote release (the owner entry
-is reclaimed with its cell/isolate); nested deployed-script facets are limited
-to the gatekeeper/gadget parent-chain shape.
+Nested deployed-script facets are limited to the gatekeeper/gadget parent-chain
+shape.
+
+Disposing a foreign capability on a node that only received it sends no remote
+release, and that is the decided contract: the reference count is per process,
+so a receiver holds no entry to release and the owner's handle is reclaimed with
+its cell or isolate. See
+[reclaiming a capability's owner entry](guarantees.md#reclaiming-a-capabilitys-owner-entry).
 
 An in-flight RPC or stream at the instant of a hard kill is not replayed. That
 is a decided contract, not an open gap: the runtime cannot prove the handler did

@@ -381,6 +381,23 @@ side effect for a maybe-lost call, and the runtime cannot tell which case it is
 in. A caller that needs at-most-once keeps its own idempotency key; celld
 does not invent one.
 
+### Reclaiming a capability's owner entry
+
+A capability's reference count is per process. The isolate that mints a handle
+counts it; receiving the handle over RPC does not, unless the receiver calls
+`dup()`, persists it with `capabilityToken()`, or re-exports it. Disposing a
+capability on a node that merely received it is therefore inert: that node has
+no entry to release, so no remote dispose is sent, and the owner's handle is
+reclaimed when its cell or isolate goes away.
+
+This is the contract, not a missing message. A fleet-wide count would need a
+shared table with a lease per handle, and its liveness would have to go through
+the same bucket CAS that already reclaims a lost owner, to free an entry that is
+cheap and dies with its isolate anyway. What the application can rely on is the
+ownership rule: a disposed handle fails with `disposed`, and a handle whose
+owner is gone or moved fails with `owner-gone`/`owner-moved` instead of
+silently resolving to a new target.
+
 ## Alarm discovery and the wake format
 
 SQLite stores the alarm deadline, consumption, retry state, and installation

@@ -203,9 +203,17 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
   not a gap: the caller gets `transport`/`owner-moved`, and retry is the
   application's decision. See
   [in-flight calls at a hard kill](guarantees.md#in-flight-calls-at-a-hard-kill).
-- Disposing a foreign capability on a receiving node does not currently send a
-  remote release; the owner entry is reclaimed with its cell/isolate.  Durable
-  rows are irrevocable in the stored window.  A token persisted by
+- Disposing a foreign capability on a receiving node does not send a remote
+  release; the owner entry is reclaimed with its cell/isolate. This is the
+  intended contract, not a missing wire message: the reference table is per
+  process, and a node that received a capability over RPC holds no entry for it
+  (only `dup()`, `capabilityToken()` and re-exporting take one). A release on
+  that node is therefore inert, and only the exporting process's final release
+  asks the owner to dispose. Fleet-wide reference counting would need a shared
+  table with an ownership lease per handle, and its liveness would have to be
+  resolved through the same bucket CAS that already reclaims a lost owner, for
+  no user-visible gain: the owner entry is cheap and dies with its isolate.
+  Durable rows are irrevocable in the stored window.  A token persisted by
   `capabilityToken` behaves the same way: it holds one exported reference until
   the application deletes the row, and the owner's handle is reclaimed with its
   isolate.
