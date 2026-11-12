@@ -40,6 +40,20 @@ APIs, and Wrangler configuration.
   connection intent and reconnect.
 - A node limits the resident cells and outbound WebSockets.
 
+## Facets
+
+- A facet can start facets of its own, to a total depth of 4 that counts the
+  root object. The depth is the length of the facet's name path under its root,
+  and starting one past it throws at the `ctx.facets.get()` call.
+- A facet can mint a persistent stub with `ctx.restore()` only through a parent
+  stub its own root created with `ctx.restore()`. The root's row stores the
+  parent handle and the params; reopening the stub replays that chain one level
+  at a time, re-minting each parent from its own row. A nested chain therefore
+  has to hang from one root object, which is the shape gatekeeper/gadget facets
+  use, and that is the supported one. When the durable data belongs to a
+  separately deployed script, use its own Durable Object reached through a
+  service binding; a persistent-stub chain does not span two roots.
+
 ## Platforms
 
 - The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple

@@ -222,9 +222,12 @@ envelopes.  `onRpcBroken` uses `error.code`, never message regexes.
   token and the application rewrites the row.  That is the intended lifetime —
   the ticket is the subscription, not the connection.
 - Nested facets across deployed scripts are limited to the parent-chain shape
-  used by gatekeeper/gadget facets.
-- The operator `/metrics` endpoint is internal-listener only; no external
-  scraping/auth policy is defined yet.
+  used by gatekeeper/gadget facets. A persistent-stub chain hangs from one root
+  object and replays one level at a time; it does not span two roots. See
+  [facets](limitations.md#facets).
+- The operator `/metrics` endpoint is internal-listener only by default and
+  accepts an optional `CELLD_METRICS_TOKEN` bearer policy. See
+  [protect the metrics endpoint](security.md#protect-the-metrics-endpoint).
 - The pre-C required-features gap above.
 
 ## Evidence and CI

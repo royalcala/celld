@@ -4538,6 +4538,46 @@ mod tests {
             .expect("restore table");
         assert_eq!(name, "_cf_RESTORE");
     }
+
+    /// CELLD-9: nesting is capped at a total depth of 4 that counts the root
+    /// object, so a root may start three facets under one name path. The guard
+    /// runs before the facet's database is touched, which is why a synthetic
+    /// identity can exercise it without a filesystem.
+    #[test]
+    fn a_fourth_nested_facet_is_refused() {
+        fn parent_with(depth: usize) -> StorageIdentity {
+            StorageIdentity {
+                root_path: "/nonexistent/root.sqlite".to_owned(),
+                root_scope: "Supervisor:root".to_owned(),
+                facet_path: (0..depth).map(|index| format!("level{index}")).collect(),
+                epoch: 1,
+                root_position: 0,
+                root_observed: None,
+            }
+        }
+        let path = std::path::Path::new("/nonexistent/facet.sqlite");
+        // A root (depth 0) may start a facet, and so may the facet below it:
+        // three name segments below the root put the total at 4. These calls
+        // fail on the missing database, which is past the cap; the assertion is
+        // only that the cap itself did not fire.
+        for depth in 0..3 {
+            let error = open_embedded("App:facet", &parent_with(depth), "child", path, true, false)
+                .expect_err("the missing database must fail the open");
+            assert!(
+                !error.to_string().contains("Facet nesting depth limit"),
+                "depth {depth} must not be refused: {error}"
+            );
+        }
+        // A facet already three levels under its root cannot start another.
+        let error = open_embedded("App:facet", &parent_with(3), "child", path, true, false)
+            .expect_err("the fourth level must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("Facet nesting depth limit exceeded"),
+            "the cap must fire at depth 4, got: {error}"
+        );
+    }
 }
 
 #[cfg(celld_internal_tests)]

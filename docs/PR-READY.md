@@ -77,8 +77,11 @@ re-acquired, durable handles ride the bounded compat path.
 
 ## Known limits
 
-Nested deployed-script facets are limited to the gatekeeper/gadget parent-chain
-shape.
+Nested deployed-script facets are limited to the parent-chain shape
+gatekeeper/gadget facets use. That is documented as an explicit limitation, not
+an open gap: a persistent-stub chain hangs from one root and replays one level
+at a time, so it does not span two separately deployed roots. See
+[facets](limitations.md#facets).
 
 Disposing a foreign capability on a node that only received it sends no remote
 release, and that is the decided contract: the reference count is per process,
