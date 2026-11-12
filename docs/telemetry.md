@@ -73,8 +73,13 @@ sheds.
 celld serves a Prometheus text exposition at `/metrics` on its **internal
 operator listener**. The Worker listener never exposes it, so keep the internal
 listener on loopback or a trusted private network, like the rest of the
-operator API. The endpoint is unauthenticated and carries no request body,
-header, token, or request-derived label value.
+operator API. The endpoint carries no request body, header, token, or
+request-derived label value.
+
+The default protection is that network boundary. Set `CELLD_METRICS_TOKEN` to
+also require `Authorization: Bearer <token>`; a missing or wrong token gets 401
+with `WWW-Authenticate: Bearer`. See
+[protect the metrics endpoint](security.md#protect-the-metrics-endpoint).
 
 `celld dev` starts its node on an ephemeral operator port. Pass
 `--internal-port PORT` to pin it, and `--metrics` to print the discovered URL

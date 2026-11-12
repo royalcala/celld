@@ -1339,6 +1339,11 @@ pub struct AppHandle {
     /// Object ingress. The same value must govern both entry points because a
     /// caller can choose either route for an ordinary Durable Object.
     pub max_request_body_bytes: usize,
+    /// Bearer token a scraper must present on `/metrics`, or `None` to rely on
+    /// the internal listener's network boundary alone. `CELLD_METRICS_TOKEN`
+    /// sets it; an empty value is treated as unset so an accidental blank does
+    /// not lock every scraper out.
+    pub metrics_token: Option<Arc<str>>,
     /// The complete retry budget for a contradicted remote ownership
     /// generation. This is the same operation deadline that bounds the
     /// decision core, so a shell retry cannot outlive its core operation.

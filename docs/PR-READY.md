@@ -79,9 +79,13 @@ re-acquired, durable handles ride the bounded compat path.
 
 In-flight RPC/stream at the instant of a hard kill is ambiguous and not
 replayed; disposing a foreign capability does not send a remote release (the
-owner entry is reclaimed with its cell/isolate); the operator `/metrics` has no
-external auth/scrape policy; nested deployed-script facets are limited to the
-gatekeeper/gadget parent-chain shape.
+owner entry is reclaimed with its cell/isolate); nested deployed-script facets
+are limited to the gatekeeper/gadget parent-chain shape.
+
+The operator `/metrics` exposure is no longer open: the endpoint keeps the
+internal listener's network boundary as its default and accepts an optional
+`CELLD_METRICS_TOKEN` bearer policy. See
+[protect the metrics endpoint](security.md#protect-the-metrics-endpoint).
 
 ## Review focus
 

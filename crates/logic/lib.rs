@@ -23,6 +23,7 @@ pub mod isolate;
 pub mod kv;
 pub mod log_evict;
 pub mod log_tier;
+pub mod metrics;
 mod output_gate;
 pub mod peer;
 pub mod pressure;

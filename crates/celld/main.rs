@@ -310,6 +310,17 @@ fn response(status: StatusCode, body: impl Into<Bytes>) -> HttpReply {
         .expect("static HTTP response")
 }
 
+/// The scrape token for `/metrics`, or `None` to rely on the listener's
+/// network boundary. A blank value is unset: an empty `CELLD_METRICS_TOKEN`
+/// must not silently refuse every scraper, and treating it as configured would
+/// be a footgun that only shows up as a broken dashboard.
+fn metrics_token() -> anyhow::Result<Option<Arc<str>>> {
+    Ok(celld::env_vars::value("CELLD_METRICS_TOKEN")?
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .map(Arc::from))
+}
+
 fn asset_response(response: axum::response::Response) -> HttpReply {
     response.map(|body| body.map_err(std::io::Error::other).boxed_unsync())
 }
@@ -2820,6 +2831,36 @@ async fn internal_handoff(request: Request<Incoming>, app: AppHandle) -> HttpRep
     }
 }
 
+/// The Prometheus exposition, guarded by the operator's scrape policy.
+///
+/// The endpoint keeps its network-boundary default: with no token configured it
+/// serves every caller the private listener reaches. A configured token narrows
+/// that to a scraper that presents `Authorization: Bearer <token>`, which is
+/// the case a metrics pipeline crossing a boundary the overlay does not cover
+/// needs. The policy is a pure predicate in `celld_logic::metrics` so the route
+/// and its tests cannot drift.
+async fn internal_metrics(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let authorization = request
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    match celld_logic::metrics::metrics_access(app.metrics_token.as_deref(), authorization) {
+        celld_logic::metrics::MetricsAccess::Allow => {
+            response(StatusCode::OK, celld::observability::render())
+        }
+        celld_logic::metrics::MetricsAccess::Unauthorized => {
+            let mut reply = response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+            // RFC 9110 requires a challenge on a 401 so a scraper knows the
+            // scheme to use instead of retrying with none.
+            reply.headers_mut().insert(
+                hyper::header::WWW_AUTHENTICATE,
+                hyper::header::HeaderValue::from_static("Bearer"),
+            );
+            reply
+        }
+    }
+}
+
 /// The log tier's follower endpoints (crate::node_log): append fsyncs
 /// entries and answers the ack-all vote, seal persists the fence mark
 /// before replying, tail hands recovery the held fragment. Fleet-HMAC
@@ -3003,7 +3044,7 @@ async fn handle_internal(
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
-        "/metrics" => response(StatusCode::OK, celld::observability::render()),
+        "/metrics" => internal_metrics(request, app).await,
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -4368,6 +4409,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
         )?,
         max_request_body_bytes,
+        metrics_token: metrics_token()?,
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };

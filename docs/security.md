@@ -51,6 +51,34 @@ Every path to a runtime class therefore demands the fleet secret. The HMAC
 does not authenticate tunnel bytes after establishment and does not encrypt
 traffic, so it does not replace the private network.
 
+## Protect the metrics endpoint
+
+`/metrics` is a route on the internal listener, so its default protection is
+the same network boundary as the rest of the operator API: loopback or an
+encrypted overlay. The exposition carries counters, summaries, and fixed label
+values only. It never includes a request body, header value, token, or a
+request-derived label, so a reader cannot use it to reach application data.
+
+An operator whose scraper crosses a boundary the overlay does not cover can add
+a bearer token. Set `CELLD_METRICS_TOKEN` and the route requires
+`Authorization: Bearer <token>` on every request:
+
+```text
+GET /metrics
+Authorization: Bearer <token>
+```
+
+celld answers 401 with `WWW-Authenticate: Bearer` when the header is missing, the
+scheme is not `Bearer`, or the token differs. The comparison is constant time,
+so a caller cannot learn the token byte by byte from response timing. The token
+is read from the environment at startup, like every other operator setting, and
+a blank value counts as unset: an accidental empty variable must not refuse
+every scraper.
+
+The token authenticates a scraper to one node. It does not encrypt traffic, so
+keep the listener on loopback or a private overlay either way, and do not reuse
+the fleet secret as the scrape token.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or
